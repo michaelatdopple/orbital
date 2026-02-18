@@ -304,7 +304,7 @@ func (bm *BuildManager) StartBuild(req BuildRequest) (*Build, error) {
 
 	// Create artifact directory.
 	artifactDir := filepath.Join(bm.baseDir, "artifacts", id, "out")
-	if err := os.MkdirAll(artifactDir, 0o755); err != nil {
+	if err := os.MkdirAll(artifactDir, 0o775); err != nil {
 		return nil, fmt.Errorf("failed to create artifact dir: %w", err)
 	}
 

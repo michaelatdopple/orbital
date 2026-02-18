@@ -3,6 +3,18 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+REBUILD_CONTAINERS=false
+for arg in "$@"; do
+    case "$arg" in
+        --rebuild-containers) REBUILD_CONTAINERS=true ;;
+        -h|--help)
+            echo "Usage: setup.sh [--rebuild-containers]"
+            echo "  --rebuild-containers  Rebuild and restart Docker containers"
+            exit 0
+            ;;
+    esac
+done
+
 DATA_DIR="$HOME/orbital-data"
 
 echo "=== Orbital Guard Setup ==="
@@ -42,7 +54,11 @@ echo "--- Setting up data directory ---"
 sudo mkdir -p "$DATA_DIR/workspaces" "$DATA_DIR/artifacts" "$DATA_DIR/certs"
 sudo chown -R orbital-guard:orbital "$DATA_DIR"
 sudo chmod 2775 "$DATA_DIR" "$DATA_DIR/workspaces" "$DATA_DIR/artifacts" "$DATA_DIR/certs"
+# Docker Desktop VirtioFS uses the host user's identity for all container file
+# access, so the host user must be in the orbital group for group-write to work.
+sudo dseditgroup -o edit -a "$(whoami)" -t user orbital
 echo "✓ $DATA_DIR ready (orbital-guard:orbital, SGID)"
+echo "✓ $(whoami) added to orbital group (required for Docker VirtioFS)"
 echo ""
 
 # 6. Copy TLS certs
@@ -92,20 +108,27 @@ curl -sk https://127.0.0.1:9090/health && echo ""
 make status
 echo ""
 
-# 12. Rebuild and restart containers
-echo "--- Rebuilding containers ---"
-COMPOSE="$HOME/Dev/containers/claude-dev/docker-compose.yml"
-if [ -f "$COMPOSE" ]; then
-    docker compose -f "$COMPOSE" --profile arm64 --profile amd64 up -d --build 2>&1 | tail -10
-    echo ""
-    echo "--- Container doctor checks ---"
-    sleep 3
-    for c in claude claude-ndk; do
-        if docker ps --format '{{.Names}}' | grep -q "^${c}$"; then
-            echo "  $c:"
-            docker exec "$c" orbital doctor 2>&1 | grep "Summary:"
-        fi
-    done
+# 12. Rebuild and restart containers (only with --rebuild-containers)
+if $REBUILD_CONTAINERS; then
+    echo "--- Rebuilding containers ---"
+    COMPOSE="$HOME/Dev/containers/claude-dev/docker-compose.yml"
+    if [ -f "$COMPOSE" ]; then
+        docker compose -f "$COMPOSE" --profile arm64 --profile amd64 up -d --build 2>&1 | tail -10
+        echo ""
+        echo "--- Container doctor checks ---"
+        sleep 3
+        for c in claude claude-ndk; do
+            if docker ps --format '{{.Names}}' | grep -q "^${c}$"; then
+                echo "  $c:"
+                docker exec "$c" orbital doctor 2>&1 | grep "Summary:"
+            fi
+        done
+    fi
+else
+    echo "--- Skipping container rebuild (use --rebuild-containers to include) ---"
+    echo "  To hot-patch running containers:"
+    echo "    docker cp ~/Dev/containers/claude-dev/orbital-client claude:/usr/local/bin/orbital"
+    echo "    docker cp ~/Dev/containers/claude-dev/orbital-client claude-ndk:/usr/local/bin/orbital"
 fi
 
 echo ""

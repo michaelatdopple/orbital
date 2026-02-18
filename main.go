@@ -48,7 +48,7 @@ func main() {
 	// -----------------------------------------------------------------------
 	for _, sub := range []string{"workspaces", "artifacts"} {
 		dir := filepath.Join(*baseDir, sub)
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+		if err := os.MkdirAll(dir, 0o775); err != nil {
 			log.Fatalf("failed to create directory %s: %v", dir, err)
 		}
 	}
