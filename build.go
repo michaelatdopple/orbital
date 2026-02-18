@@ -43,6 +43,7 @@ type Build struct {
 	Tasks       []string    `json:"tasks"`
 	Properties  []string    `json:"properties,omitempty"`
 	Container   string      `json:"container,omitempty"`
+	PreBuild    []string    `json:"pre_build,omitempty"`
 	ExitCode    int         `json:"exit_code"`
 	StartedAt   time.Time   `json:"started_at"`
 	FinishedAt  time.Time   `json:"finished_at,omitempty"`
@@ -183,6 +184,7 @@ type BuildRequest struct {
 	Tasks      []string          `json:"tasks"`
 	Properties map[string]string `json:"properties,omitempty"`
 	Container  string            `json:"container,omitempty"`
+	PreBuild   []string          `json:"pre_build,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -239,6 +241,7 @@ func (bm *BuildManager) StartBuild(req BuildRequest) (*Build, error) {
 		Tasks:       req.Tasks,
 		Properties:  propArgs,
 		Container:   req.Container,
+		PreBuild:    req.PreBuild,
 		StartedAt:   time.Now(),
 		ArtifactDir: filepath.Join("orbital", "artifacts", id, "out"),
 		done:        make(chan struct{}),
@@ -254,9 +257,34 @@ func (bm *BuildManager) StartBuild(req BuildRequest) (*Build, error) {
 	return build, nil
 }
 
-// runBuild executes gradlew and captures output.
+// runBuild executes pre-build commands then gradlew and captures output.
 func (bm *BuildManager) runBuild(b *Build, wsDir, artifactDir string) {
 	defer close(b.done)
+
+	// Run pre-build commands (e.g. npm install, yarn install).
+	for i, cmdStr := range b.PreBuild {
+		b.addLogLine(fmt.Sprintf("Pre-build [%d/%d]: %s", i+1, len(b.PreBuild), cmdStr))
+
+		preCmd := exec.Command("sh", "-c", cmdStr)
+		preCmd.Dir = wsDir
+		preCmd.Env = os.Environ()
+
+		preOut, err := preCmd.CombinedOutput()
+		if len(preOut) > 0 {
+			for _, line := range strings.Split(strings.TrimRight(string(preOut), "\n"), "\n") {
+				b.addLogLine(line)
+			}
+		}
+		if err != nil {
+			b.addLogLine(fmt.Sprintf("Pre-build failed: %v", err))
+			b.mu.Lock()
+			b.Status = StatusFailed
+			b.ExitCode = 1
+			b.FinishedAt = time.Now()
+			b.mu.Unlock()
+			return
+		}
+	}
 
 	args := make([]string, 0, len(b.Tasks)+len(b.Properties))
 	args = append(args, b.Tasks...)
