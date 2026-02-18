@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+
+    <!-- Service identity -->
+    <key>Label</key>
+    <string>com.claude.orbital</string>
+
+    <!-- Binary to run -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/orbital-server</string>
+    </array>
+
+    <!-- Start automatically on login -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart if the process exits unexpectedly -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Working directory -->
+    <key>WorkingDirectory</key>
+    <string>__HOME__</string>
+
+    <!-- Log output (stdout + stderr to same file) -->
+    <key>StandardOutPath</key>
+    <string>/tmp/orbital.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/orbital.log</string>
+
+    <!-- Environment: PATH needs common tool locations so the Go binary
+         can find gradle, java, adb, etc. The binary reads additional
+         config from ~/.orbital.env at startup. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    </dict>
+
+</dict>
+</plist>
