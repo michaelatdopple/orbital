@@ -22,9 +22,13 @@ func main() {
 	// -----------------------------------------------------------------------
 	port := flag.Int("port", 9090, "HTTP listen port")
 	baseDir := flag.String("base-dir", "", "Base directory for workspaces and artifacts (default: ~/claude-share/orbital)")
+	configFile := flag.String("config", "", "Path to config env file (default: ~/.orbital.env)")
 	tlsCert := flag.String("tls-cert", "", "Path to TLS certificate file (enables HTTPS)")
 	tlsKey := flag.String("tls-key", "", "Path to TLS private key file")
 	flag.Parse()
+
+	// Set umask for group-writable files (shared with container via orbital group).
+	syscall.Umask(0o002)
 
 	if *baseDir == "" {
 		home, err := os.UserHomeDir()
@@ -35,9 +39,9 @@ func main() {
 	}
 
 	// -----------------------------------------------------------------------
-	// Load optional config from ~/.orbital.env
+	// Load optional config from env file
 	// -----------------------------------------------------------------------
-	loadEnvFile()
+	loadEnvFile(*configFile)
 
 	// -----------------------------------------------------------------------
 	// Ensure base directories exist
@@ -69,9 +73,19 @@ func main() {
 	}
 
 	// -----------------------------------------------------------------------
+	// Security
+	// -----------------------------------------------------------------------
+	policy := DefaultPolicy()
+	if auditPath := os.Getenv("ORBITAL_AUDIT_LOG"); auditPath != "" {
+		policy.AuditLogPath = auditPath
+	}
+	audit := NewAuditLogger(policy.AuditLogPath)
+	defer audit.Close()
+
+	// -----------------------------------------------------------------------
 	// Managers
 	// -----------------------------------------------------------------------
-	bm := NewBuildManager(*baseDir)
+	bm := NewBuildManager(*baseDir, policy, audit)
 	wm := NewWorkspaceManager(*baseDir)
 	doc := NewDoctorManager(*baseDir)
 
@@ -201,21 +215,24 @@ func main() {
 	log.Println("orbital: stopped")
 }
 
-// loadEnvFile reads ~/.orbital.env if it exists and sets environment variables.
+// loadEnvFile reads a config file and sets environment variables.
+// Falls back to ~/.orbital.env if no explicit path is given.
 // Format: KEY=VALUE (one per line, # comments, empty lines ignored).
-func loadEnvFile() {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return
+func loadEnvFile(path string) {
+	if path == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return
+		}
+		path = filepath.Join(home, ".orbital.env")
 	}
-	envFile := filepath.Join(home, ".orbital.env")
-	f, err := os.Open(envFile)
+	f, err := os.Open(path)
 	if err != nil {
 		return
 	}
 	defer f.Close()
 
-	log.Printf("orbital: loading config from %s", envFile)
+	log.Printf("orbital: loading config from %s", path)
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())

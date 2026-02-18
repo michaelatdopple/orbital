@@ -8,38 +8,52 @@
     <key>Label</key>
     <string>com.claude.orbital</string>
 
-    <!-- Binary to run -->
+    <!-- Binary and arguments -->
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/orbital-server</string>
+        <string>/opt/orbital/bin/orbital</string>
+        <string>--base-dir</string>
+        <string>/Users/michaelfinkler/orbital-data</string>
+        <string>--config</string>
+        <string>/opt/orbital/etc/orbital.env</string>
     </array>
 
-    <!-- Start automatically on login -->
-    <key>RunAtLoad</key>
-    <true/>
-
-    <!-- Restart if the process exits unexpectedly -->
-    <key>KeepAlive</key>
-    <true/>
+    <!-- Run as orbital-guard user -->
+    <key>UserName</key>
+    <string>orbital-guard</string>
+    <key>GroupName</key>
+    <string>orbital</string>
 
     <!-- Working directory -->
     <key>WorkingDirectory</key>
-    <string>__HOME__</string>
+    <string>/opt/orbital</string>
 
-    <!-- Log output (stdout + stderr to same file) -->
-    <key>StandardOutPath</key>
-    <string>/tmp/orbital.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/orbital.log</string>
-
-    <!-- Environment: PATH needs common tool locations so the Go binary
-         can find gradle, java, adb, etc. The binary reads additional
-         config from ~/.orbital.env at startup. -->
+    <!-- Environment -->
     <key>EnvironmentVariables</key>
     <dict>
+        <key>HOME</key>
+        <string>/opt/orbital</string>
         <key>PATH</key>
-        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <string>/opt/orbital/bin:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
     </dict>
+
+    <!-- Start at boot, restart on crash -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Logging -->
+    <key>StandardOutPath</key>
+    <string>/opt/orbital/log/orbital.log</string>
+    <key>StandardErrorPath</key>
+    <string>/opt/orbital/log/orbital.log</string>
+
+    <!-- Resource limits -->
+    <key>ProcessType</key>
+    <string>Standard</string>
+    <key>Nice</key>
+    <integer>5</integer>
 
 </dict>
 </plist>

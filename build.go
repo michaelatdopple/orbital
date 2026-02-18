@@ -114,13 +114,19 @@ type BuildManager struct {
 	mu      sync.RWMutex
 	builds  map[string]*Build
 	baseDir string
+	policy  *SecurityPolicy
+	limiter *BuildLimiter
+	audit   *AuditLogger
 }
 
-// NewBuildManager creates a new manager rooted at baseDir.
-func NewBuildManager(baseDir string) *BuildManager {
+// NewBuildManager creates a new manager rooted at baseDir with security policy.
+func NewBuildManager(baseDir string, policy *SecurityPolicy, audit *AuditLogger) *BuildManager {
 	return &BuildManager{
 		builds:  make(map[string]*Build),
 		baseDir: baseDir,
+		policy:  policy,
+		limiter: NewBuildLimiter(policy.MaxConcurrentBuilds),
+		audit:   audit,
 	}
 }
 
@@ -200,10 +206,46 @@ func (bm *BuildManager) StartBuild(req BuildRequest) (*Build, error) {
 		return nil, fmt.Errorf("at least one task is required")
 	}
 
+	// --- Security: validate tasks ---
+	if err := bm.policy.ValidateTasks(req.Tasks); err != nil {
+		bm.audit.Log("build_rejected", map[string]string{
+			"reason":    "invalid_task",
+			"workspace": req.Workspace,
+			"error":     err.Error(),
+		})
+		return nil, err
+	}
+
+	// --- Security: validate properties ---
+	if err := bm.policy.ValidateProperties(req.Properties); err != nil {
+		bm.audit.Log("build_rejected", map[string]string{
+			"reason":    "blocked_property",
+			"workspace": req.Workspace,
+			"error":     err.Error(),
+		})
+		return nil, err
+	}
+
+	// --- Security: validate pre-build commands ---
+	if err := bm.policy.ValidatePreBuild(req.PreBuild); err != nil {
+		bm.audit.Log("build_rejected", map[string]string{
+			"reason":    "blocked_prebuild",
+			"workspace": req.Workspace,
+			"error":     err.Error(),
+		})
+		return nil, err
+	}
+
+	// --- Security: concurrency limit ---
+	if err := bm.limiter.Acquire(); err != nil {
+		return nil, err
+	}
+
 	// Convert properties map to CLI args (e.g. {"-Pkey": "value"} -> ["-Pkey=value"]).
 	var propArgs []string
 	for k, v := range req.Properties {
 		if !strings.HasPrefix(k, "-") {
+			bm.limiter.Release()
 			return nil, fmt.Errorf("invalid property key %q: must start with -", k)
 		}
 		if v != "" {
@@ -216,17 +258,49 @@ func (bm *BuildManager) StartBuild(req BuildRequest) (*Build, error) {
 	// Resolve workspace path with traversal protection.
 	wsDir, err := safeSubpath(filepath.Join(bm.baseDir, "workspaces"), req.Workspace)
 	if err != nil {
+		bm.limiter.Release()
 		return nil, fmt.Errorf("workspace path error: %w", err)
+	}
+
+	// --- Security: check for symlink escapes ---
+	if err := bm.policy.CheckSymlinks(wsDir); err != nil {
+		bm.limiter.Release()
+		bm.audit.Log("build_rejected", map[string]string{
+			"reason":    "symlink_escape",
+			"workspace": req.Workspace,
+			"error":     err.Error(),
+		})
+		return nil, err
 	}
 
 	// Verify gradlew exists.
 	gradlew := filepath.Join(wsDir, "gradlew")
 	if _, err := os.Stat(gradlew); err != nil {
+		bm.limiter.Release()
 		return nil, fmt.Errorf("gradlew not found in workspace %s: %w", req.Workspace, err)
+	}
+
+	// --- Security: verify Gradle wrapper checksum ---
+	if err := bm.policy.VerifyGradleWrapper(wsDir); err != nil {
+		bm.limiter.Release()
+		bm.audit.Log("build_rejected", map[string]string{
+			"reason":    "wrapper_checksum",
+			"workspace": req.Workspace,
+			"error":     err.Error(),
+		})
+		return nil, err
 	}
 
 	// Generate build ID.
 	id := fmt.Sprintf("%d", time.Now().UnixNano())
+
+	// Audit log the build start.
+	bm.audit.Log("build_started", map[string]string{
+		"id":        id,
+		"workspace": req.Workspace,
+		"tasks":     strings.Join(req.Tasks, ","),
+		"container": req.Container,
+	})
 
 	// Create artifact directory.
 	artifactDir := filepath.Join(bm.baseDir, "artifacts", id, "out")
@@ -260,6 +334,7 @@ func (bm *BuildManager) StartBuild(req BuildRequest) (*Build, error) {
 // runBuild executes pre-build commands then gradlew and captures output.
 func (bm *BuildManager) runBuild(b *Build, wsDir, artifactDir string) {
 	defer close(b.done)
+	defer bm.limiter.Release()
 
 	// Run pre-build commands (e.g. npm install, yarn install).
 	for i, cmdStr := range b.PreBuild {
@@ -328,6 +403,26 @@ func (bm *BuildManager) runBuild(b *Build, wsDir, artifactDir string) {
 
 	b.addLogLine(fmt.Sprintf("Started build %s: gradlew %s", b.ID, strings.Join(args, " ")))
 
+	// --- Security: enforce build timeout ---
+	timeout := bm.policy.MaxBuildDuration
+	if timeout > 0 {
+		timer := time.AfterFunc(timeout, func() {
+			b.addLogLine(fmt.Sprintf("BUILD TIMEOUT: exceeded %s — killing process", timeout))
+			bm.audit.Log("build_timeout", map[string]string{
+				"id":        b.ID,
+				"workspace": b.Workspace,
+				"timeout":   timeout.String(),
+			})
+			pgid, err := syscall.Getpgid(cmd.Process.Pid)
+			if err == nil {
+				_ = syscall.Kill(-pgid, syscall.SIGKILL)
+			} else {
+				_ = cmd.Process.Kill()
+			}
+		})
+		defer timer.Stop()
+	}
+
 	// Read output line by line.
 	buf := make([]byte, 0, 4096)
 	tmp := make([]byte, 1024)
@@ -383,6 +478,15 @@ func (bm *BuildManager) runBuild(b *Build, wsDir, artifactDir string) {
 		b.ExitCode = 0
 		b.mu.Unlock()
 	}
+
+	// Audit log the build completion.
+	bm.audit.Log("build_finished", map[string]string{
+		"id":        b.ID,
+		"workspace": b.Workspace,
+		"status":    string(b.Status),
+		"exit_code": fmt.Sprintf("%d", b.ExitCode),
+		"duration":  b.FinishedAt.Sub(b.StartedAt).String(),
+	})
 
 	// Collect artifacts (APKs and other outputs).
 	bm.collectArtifacts(b, wsDir, artifactDir)
