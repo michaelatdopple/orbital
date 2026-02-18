@@ -56,6 +56,7 @@ func main() {
 	// -----------------------------------------------------------------------
 	bm := NewBuildManager(*baseDir)
 	wm := NewWorkspaceManager(*baseDir)
+	doc := NewDoctorManager(*baseDir)
 
 	// Start the background cleanup goroutine.
 	cleanupDone := make(chan struct{})
@@ -118,6 +119,12 @@ func main() {
 		}
 		wm.handleWorkspaceByHash(w, r, hash)
 	})
+
+	// Doctor — host-side health checks.
+	mux.HandleFunc("/doctor", doc.handleDoctor)
+	mux.HandleFunc("/doctor/fix", doc.handleDoctorFix)
+	mux.HandleFunc("/doctor/token", doc.handleDoctorToken)
+	mux.HandleFunc("/doctor/verify", doc.handleDoctorVerify)
 
 	// Health check.
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
