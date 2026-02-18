@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"log"
@@ -21,6 +22,8 @@ func main() {
 	// -----------------------------------------------------------------------
 	port := flag.Int("port", 9090, "HTTP listen port")
 	baseDir := flag.String("base-dir", "", "Base directory for workspaces and artifacts (default: ~/claude-share/orbital)")
+	tlsCert := flag.String("tls-cert", "", "Path to TLS certificate file (enables HTTPS)")
+	tlsKey := flag.String("tls-key", "", "Path to TLS private key file")
 	flag.Parse()
 
 	if *baseDir == "" {
@@ -46,10 +49,24 @@ func main() {
 		}
 	}
 
+	// -----------------------------------------------------------------------
+	// Resolve TLS cert/key from flags or environment
+	// -----------------------------------------------------------------------
+	if *tlsCert == "" {
+		*tlsCert = os.Getenv("ORBITAL_TLS_CERT")
+	}
+	if *tlsKey == "" {
+		*tlsKey = os.Getenv("ORBITAL_TLS_KEY")
+	}
+	useTLS := *tlsCert != "" && *tlsKey != ""
+
 	log.Printf("orbital: base directory = %s", *baseDir)
 	log.Printf("orbital: ANDROID_HOME = %s", os.Getenv("ANDROID_HOME"))
 	log.Printf("orbital: JAVA_HOME = %s", os.Getenv("JAVA_HOME"))
 	log.Printf("orbital: GRADLE_USER_HOME = %s", os.Getenv("GRADLE_USER_HOME"))
+	if useTLS {
+		log.Printf("orbital: TLS enabled (cert=%s)", *tlsCert)
+	}
 
 	// -----------------------------------------------------------------------
 	// Managers
@@ -143,6 +160,17 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	}
 
+	if useTLS {
+		cert, err := tls.LoadX509KeyPair(*tlsCert, *tlsKey)
+		if err != nil {
+			log.Fatalf("orbital: failed to load TLS cert/key: %v", err)
+		}
+		srv.TLSConfig = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
+	}
+
 	// Graceful shutdown.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -159,9 +187,16 @@ func main() {
 		}
 	}()
 
-	log.Printf("orbital: listening on %s", addr)
-	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
-		log.Fatalf("orbital: server error: %v", err)
+	if useTLS {
+		log.Printf("orbital: listening on %s (HTTPS)", addr)
+		if err := srv.ListenAndServeTLS("", ""); err != http.ErrServerClosed {
+			log.Fatalf("orbital: server error: %v", err)
+		}
+	} else {
+		log.Printf("orbital: listening on %s (HTTP)", addr)
+		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+			log.Fatalf("orbital: server error: %v", err)
+		}
 	}
 	log.Println("orbital: stopped")
 }
