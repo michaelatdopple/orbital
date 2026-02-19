@@ -79,6 +79,12 @@ GRADLE_USER_HOME=/opt/orbital/cache/gradle
 ORBITAL_TLS_CERT=/opt/orbital/etc/certs/orbital-server.crt
 ORBITAL_TLS_KEY=/opt/orbital/etc/certs/orbital-server.key
 ORBITAL_AUDIT_LOG=/opt/orbital/log/audit.log
+
+# Signing profile: aosp (AOSP platform dev key)
+SIGNING_AOSP_KEYSTORE=/Users/michaelfinkler/Dev/Dopple/dopple-android/aosp.keystore.jks
+SIGNING_AOSP_KEYSTORE_PASSWORD=dopple-works
+SIGNING_AOSP_KEY_ALIAS=platform
+SIGNING_AOSP_KEY_PASSWORD=loop
 EOF
 sudo chown orbital-guard:orbital /opt/orbital/etc/orbital.env
 echo "✓ Config written"

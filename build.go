@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -35,20 +37,31 @@ type LogLine struct {
 	Ts   time.Time `json:"ts"`
 }
 
+// DepSpec describes a git dependency to resolve before building.
+type DepSpec struct {
+	Git string `json:"git"`
+	Ref string `json:"ref"`
+}
+
 // Build holds all state for a single build invocation.
 type Build struct {
-	ID          string      `json:"id"`
-	Status      BuildStatus `json:"status"`
-	Workspace   string      `json:"workspace"`
-	Tasks       []string    `json:"tasks"`
-	Properties  []string    `json:"properties,omitempty"`
-	Container   string      `json:"container,omitempty"`
-	PreBuild    []string    `json:"pre_build,omitempty"`
-	ExitCode    int         `json:"exit_code"`
-	StartedAt   time.Time   `json:"started_at"`
-	FinishedAt  time.Time   `json:"finished_at,omitempty"`
-	ArtifactDir string      `json:"artifact_dir"`
-	Artifacts   []string    `json:"artifacts,omitempty"`
+	ID           string              `json:"id"`
+	Status       BuildStatus         `json:"status"`
+	Workspace    string              `json:"workspace"`
+	Tasks        []string            `json:"tasks"`
+	Properties   []string            `json:"properties,omitempty"`
+	Container    string              `json:"container,omitempty"`
+	PreBuild     []string            `json:"pre_build,omitempty"`
+	BuildType    string              `json:"build_type,omitempty"`
+	BuildScript  string              `json:"build_script,omitempty"`
+	Deps           map[string]DepSpec  `json:"deps,omitempty"`
+	ArtifactDirs   []string            `json:"artifact_dirs,omitempty"`
+	SigningProfile string              `json:"signing_profile,omitempty"`
+	ExitCode       int                 `json:"exit_code"`
+	StartedAt    time.Time           `json:"started_at"`
+	FinishedAt   time.Time           `json:"finished_at,omitempty"`
+	ArtifactDir  string              `json:"artifact_dir"`
+	Artifacts    []string            `json:"artifacts,omitempty"`
 
 	cmd         *exec.Cmd
 	mu          sync.Mutex
@@ -186,11 +199,16 @@ func safeSubpath(baseDir, name string) (string, error) {
 
 // BuildRequest is the JSON body for POST /build.
 type BuildRequest struct {
-	Workspace  string            `json:"workspace"`
-	Tasks      []string          `json:"tasks"`
-	Properties map[string]string `json:"properties,omitempty"`
-	Container  string            `json:"container,omitempty"`
-	PreBuild   []string          `json:"pre_build,omitempty"`
+	Workspace    string             `json:"workspace"`
+	Tasks        []string           `json:"tasks"`
+	Properties   map[string]string  `json:"properties,omitempty"`
+	Container    string             `json:"container,omitempty"`
+	PreBuild     []string           `json:"pre_build,omitempty"`
+	BuildType    string             `json:"build_type,omitempty"`
+	BuildScript  string             `json:"build_script,omitempty"`
+	Deps           map[string]DepSpec `json:"deps,omitempty"`
+	ArtifactDirs   []string           `json:"artifact_dirs,omitempty"`
+	SigningProfile string             `json:"signing_profile,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -202,28 +220,87 @@ func (bm *BuildManager) StartBuild(req BuildRequest) (*Build, error) {
 	if !isValidHash(req.Workspace) {
 		return nil, fmt.Errorf("invalid workspace hash: must be alphanumeric/dash/underscore")
 	}
-	if len(req.Tasks) == 0 {
-		return nil, fmt.Errorf("at least one task is required")
+
+	// Default build type to "gradle".
+	buildType := req.BuildType
+	if buildType == "" {
+		buildType = "gradle"
+	}
+	if buildType != "gradle" && buildType != "script" {
+		return nil, fmt.Errorf("invalid build_type %q: must be \"gradle\" or \"script\"", buildType)
 	}
 
-	// --- Security: validate tasks ---
-	if err := bm.policy.ValidateTasks(req.Tasks); err != nil {
-		bm.audit.Log("build_rejected", map[string]string{
-			"reason":    "invalid_task",
-			"workspace": req.Workspace,
-			"error":     err.Error(),
-		})
-		return nil, err
+	// Type-specific validation.
+	switch buildType {
+	case "gradle":
+		if len(req.Tasks) == 0 {
+			return nil, fmt.Errorf("at least one task is required")
+		}
+
+		// --- Security: validate tasks ---
+		if err := bm.policy.ValidateTasks(req.Tasks); err != nil {
+			bm.audit.Log("build_rejected", map[string]string{
+				"reason":    "invalid_task",
+				"workspace": req.Workspace,
+				"error":     err.Error(),
+			})
+			return nil, err
+		}
+
+		// --- Security: validate properties ---
+		if err := bm.policy.ValidateProperties(req.Properties); err != nil {
+			bm.audit.Log("build_rejected", map[string]string{
+				"reason":    "blocked_property",
+				"workspace": req.Workspace,
+				"error":     err.Error(),
+			})
+			return nil, err
+		}
+
+	case "script":
+		if req.BuildScript == "" {
+			return nil, fmt.Errorf("build_script is required for script builds")
+		}
+		// Block path traversal in script path.
+		if strings.Contains(req.BuildScript, "..") {
+			return nil, fmt.Errorf("build_script must not contain '..'")
+		}
 	}
 
-	// --- Security: validate properties ---
-	if err := bm.policy.ValidateProperties(req.Properties); err != nil {
-		bm.audit.Log("build_rejected", map[string]string{
-			"reason":    "blocked_property",
-			"workspace": req.Workspace,
-			"error":     err.Error(),
-		})
-		return nil, err
+	// --- Security: validate deps ---
+	if len(req.Deps) > 0 {
+		if err := bm.policy.ValidateDeps(req.Deps); err != nil {
+			bm.audit.Log("build_rejected", map[string]string{
+				"reason":    "invalid_dep",
+				"workspace": req.Workspace,
+				"error":     err.Error(),
+			})
+			return nil, err
+		}
+	}
+
+	// --- Security: validate artifact dirs ---
+	if len(req.ArtifactDirs) > 0 {
+		if err := bm.policy.ValidateArtifactDirs(req.ArtifactDirs); err != nil {
+			bm.audit.Log("build_rejected", map[string]string{
+				"reason":    "invalid_artifact_dir",
+				"workspace": req.Workspace,
+				"error":     err.Error(),
+			})
+			return nil, err
+		}
+	}
+
+	// --- Security: validate signing profile ---
+	if req.SigningProfile != "" {
+		if _, err := bm.policy.ResolveSigningProfile(req.SigningProfile); err != nil {
+			bm.audit.Log("build_rejected", map[string]string{
+				"reason":    "invalid_signing_profile",
+				"workspace": req.Workspace,
+				"error":     err.Error(),
+			})
+			return nil, err
+		}
 	}
 
 	// --- Security: validate pre-build commands ---
@@ -273,22 +350,43 @@ func (bm *BuildManager) StartBuild(req BuildRequest) (*Build, error) {
 		return nil, err
 	}
 
-	// Verify gradlew exists.
-	gradlew := filepath.Join(wsDir, "gradlew")
-	if _, err := os.Stat(gradlew); err != nil {
-		bm.limiter.Release()
-		return nil, fmt.Errorf("gradlew not found in workspace %s: %w", req.Workspace, err)
-	}
+	// Type-specific executable validation.
+	switch buildType {
+	case "gradle":
+		// Verify gradlew exists.
+		gradlew := filepath.Join(wsDir, "gradlew")
+		if _, err := os.Stat(gradlew); err != nil {
+			bm.limiter.Release()
+			return nil, fmt.Errorf("gradlew not found in workspace %s: %w", req.Workspace, err)
+		}
 
-	// --- Security: verify Gradle wrapper checksum ---
-	if err := bm.policy.VerifyGradleWrapper(wsDir); err != nil {
-		bm.limiter.Release()
-		bm.audit.Log("build_rejected", map[string]string{
-			"reason":    "wrapper_checksum",
-			"workspace": req.Workspace,
-			"error":     err.Error(),
-		})
-		return nil, err
+		// --- Security: verify Gradle wrapper checksum ---
+		if err := bm.policy.VerifyGradleWrapper(wsDir); err != nil {
+			bm.limiter.Release()
+			bm.audit.Log("build_rejected", map[string]string{
+				"reason":    "wrapper_checksum",
+				"workspace": req.Workspace,
+				"error":     err.Error(),
+			})
+			return nil, err
+		}
+
+	case "script":
+		// Verify the build script exists and is executable.
+		scriptPath, err := safeSubpath(wsDir, req.BuildScript)
+		if err != nil {
+			bm.limiter.Release()
+			return nil, fmt.Errorf("build script path error: %w", err)
+		}
+		info, err := os.Stat(scriptPath)
+		if err != nil {
+			bm.limiter.Release()
+			return nil, fmt.Errorf("build script not found: %s", req.BuildScript)
+		}
+		if info.Mode()&0o111 == 0 {
+			bm.limiter.Release()
+			return nil, fmt.Errorf("build script is not executable: %s", req.BuildScript)
+		}
 	}
 
 	// Generate build ID.
@@ -296,10 +394,11 @@ func (bm *BuildManager) StartBuild(req BuildRequest) (*Build, error) {
 
 	// Audit log the build start.
 	bm.audit.Log("build_started", map[string]string{
-		"id":        id,
-		"workspace": req.Workspace,
-		"tasks":     strings.Join(req.Tasks, ","),
-		"container": req.Container,
+		"id":         id,
+		"workspace":  req.Workspace,
+		"build_type": buildType,
+		"tasks":      strings.Join(req.Tasks, ","),
+		"container":  req.Container,
 	})
 
 	// Create artifact directory.
@@ -309,16 +408,21 @@ func (bm *BuildManager) StartBuild(req BuildRequest) (*Build, error) {
 	}
 
 	build := &Build{
-		ID:          id,
-		Status:      StatusBuilding,
-		Workspace:   req.Workspace,
-		Tasks:       req.Tasks,
-		Properties:  propArgs,
-		Container:   req.Container,
-		PreBuild:    req.PreBuild,
-		StartedAt:   time.Now(),
-		ArtifactDir: filepath.Join("orbital", "artifacts", id, "out"),
-		done:        make(chan struct{}),
+		ID:           id,
+		Status:       StatusBuilding,
+		Workspace:    req.Workspace,
+		Tasks:        req.Tasks,
+		Properties:   propArgs,
+		Container:    req.Container,
+		PreBuild:     req.PreBuild,
+		BuildType:    buildType,
+		BuildScript:  req.BuildScript,
+		Deps:           req.Deps,
+		ArtifactDirs:   req.ArtifactDirs,
+		SigningProfile: req.SigningProfile,
+		StartedAt:      time.Now(),
+		ArtifactDir:  filepath.Join("orbital", "artifacts", id, "out"),
+		done:         make(chan struct{}),
 	}
 
 	bm.mu.Lock()
@@ -329,6 +433,97 @@ func (bm *BuildManager) StartBuild(req BuildRequest) (*Build, error) {
 	go bm.runBuild(build, wsDir, artifactDir)
 
 	return build, nil
+}
+
+// resolveDeps clones or fetches git dependencies into a shared cache and returns
+// environment variable assignments (KEY=/path/to/dep) for injection into the build.
+func (bm *BuildManager) resolveDeps(b *Build) ([]string, error) {
+	if len(b.Deps) == 0 {
+		return nil, nil
+	}
+
+	depsDir := filepath.Join(bm.baseDir, "deps")
+	if err := os.MkdirAll(depsDir, 0o775); err != nil {
+		return nil, fmt.Errorf("failed to create deps dir: %w", err)
+	}
+
+	var envVars []string
+	for name, dep := range b.Deps {
+		h := sha256.Sum256([]byte(dep.Git))
+		hash := hex.EncodeToString(h[:])[:16]
+		depDir := filepath.Join(depsDir, hash)
+		lockPath := filepath.Join(depsDir, hash+".lock")
+
+		b.addLogLine(fmt.Sprintf("Resolving dep %s: %s#%s → %s", name, dep.Git, dep.Ref, depDir))
+
+		if err := resolveOneDep(dep, depDir, lockPath, b); err != nil {
+			return nil, fmt.Errorf("dep %s: %w", name, err)
+		}
+
+		envVars = append(envVars, name+"="+depDir)
+	}
+	return envVars, nil
+}
+
+// resolveOneDep clones or fetches a single git dependency under flock.
+func resolveOneDep(dep DepSpec, depDir, lockPath string, b *Build) error {
+	// Acquire file lock.
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o664)
+	if err != nil {
+		return fmt.Errorf("cannot create lock file: %w", err)
+	}
+	defer lockFile.Close()
+
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("cannot acquire lock: %w", err)
+	}
+	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+
+	needsClone := false
+	if _, err := os.Stat(filepath.Join(depDir, ".git")); os.IsNotExist(err) {
+		needsClone = true
+	}
+
+	if needsClone {
+		b.addLogLine(fmt.Sprintf("  Cloning %s ...", dep.Git))
+		out, err := exec.Command("git", "clone", "--no-checkout", dep.Git, depDir).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("git clone failed: %s: %w", strings.TrimSpace(string(out)), err)
+		}
+	}
+
+	// Fetch the requested ref.
+	b.addLogLine(fmt.Sprintf("  Fetching ref %s ...", dep.Ref))
+	fetchCmd := exec.Command("git", "-C", depDir, "fetch", "origin", dep.Ref)
+	fetchOut, fetchErr := fetchCmd.CombinedOutput()
+	if fetchErr != nil {
+		if !needsClone {
+			// Cached repo might be corrupt — delete and retry clone once.
+			b.addLogLine("  Fetch failed on cached repo, re-cloning...")
+			_ = os.RemoveAll(depDir)
+			cloneOut, cloneErr := exec.Command("git", "clone", "--no-checkout", dep.Git, depDir).CombinedOutput()
+			if cloneErr != nil {
+				return fmt.Errorf("git clone (retry) failed: %s: %w", strings.TrimSpace(string(cloneOut)), cloneErr)
+			}
+			fetchCmd2 := exec.Command("git", "-C", depDir, "fetch", "origin", dep.Ref)
+			fetchOut2, fetchErr2 := fetchCmd2.CombinedOutput()
+			if fetchErr2 != nil {
+				return fmt.Errorf("git fetch (retry) failed: %s: %w", strings.TrimSpace(string(fetchOut2)), fetchErr2)
+			}
+		} else {
+			return fmt.Errorf("git fetch failed: %s: %w", strings.TrimSpace(string(fetchOut)), fetchErr)
+		}
+	}
+
+	// Checkout FETCH_HEAD.
+	checkoutCmd := exec.Command("git", "-C", depDir, "checkout", "FETCH_HEAD")
+	checkoutOut, checkoutErr := checkoutCmd.CombinedOutput()
+	if checkoutErr != nil {
+		return fmt.Errorf("git checkout failed: %s: %w", strings.TrimSpace(string(checkoutOut)), checkoutErr)
+	}
+
+	b.addLogLine(fmt.Sprintf("  Dep %s ready", dep.Git))
+	return nil
 }
 
 // runBuild executes pre-build commands then gradlew and captures output.
@@ -361,15 +556,55 @@ func (bm *BuildManager) runBuild(b *Build, wsDir, artifactDir string) {
 		}
 	}
 
-	args := make([]string, 0, len(b.Tasks)+len(b.Properties))
-	args = append(args, b.Tasks...)
-	args = append(args, b.Properties...)
+	// Resolve git dependencies (script builds only).
+	var depEnv []string
+	if len(b.Deps) > 0 {
+		var depErr error
+		depEnv, depErr = bm.resolveDeps(b)
+		if depErr != nil {
+			b.addLogLine(fmt.Sprintf("ERROR: dependency resolution failed: %v", depErr))
+			b.mu.Lock()
+			b.Status = StatusFailed
+			b.ExitCode = 1
+			b.FinishedAt = time.Now()
+			b.mu.Unlock()
+			return
+		}
+	}
 
-	cmd := exec.Command(filepath.Join(wsDir, "gradlew"), args...)
-	cmd.Dir = wsDir
+	var cmd *exec.Cmd
+	switch b.BuildType {
+	case "script":
+		cmd = exec.Command(filepath.Join(wsDir, b.BuildScript))
+		cmd.Dir = wsDir
+	default: // "gradle"
+		args := make([]string, 0, len(b.Tasks)+len(b.Properties))
+		args = append(args, b.Tasks...)
+		args = append(args, b.Properties...)
+		cmd = exec.Command(filepath.Join(wsDir, "gradlew"), args...)
+		cmd.Dir = wsDir
+	}
 
-	// Propagate environment.
-	cmd.Env = os.Environ()
+	// Resolve signing profile env vars.
+	var signingEnv []string
+	if b.SigningProfile != "" {
+		var sigErr error
+		signingEnv, sigErr = bm.policy.ResolveSigningProfile(b.SigningProfile)
+		if sigErr != nil {
+			b.addLogLine(fmt.Sprintf("ERROR: signing profile resolution failed: %v", sigErr))
+			b.mu.Lock()
+			b.Status = StatusFailed
+			b.ExitCode = 1
+			b.FinishedAt = time.Now()
+			b.mu.Unlock()
+			return
+		}
+		b.addLogLine(fmt.Sprintf("Signing profile %q: keystore loaded", b.SigningProfile))
+	}
+
+	// Propagate environment, including resolved dep paths and signing config.
+	cmd.Env = append(os.Environ(), depEnv...)
+	cmd.Env = append(cmd.Env, signingEnv...)
 
 	// Use a process group so we can kill the whole tree.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -401,7 +636,12 @@ func (bm *BuildManager) runBuild(b *Build, wsDir, artifactDir string) {
 		return
 	}
 
-	b.addLogLine(fmt.Sprintf("Started build %s: gradlew %s", b.ID, strings.Join(args, " ")))
+	switch b.BuildType {
+	case "script":
+		b.addLogLine(fmt.Sprintf("Started build %s: script %s", b.ID, b.BuildScript))
+	default:
+		b.addLogLine(fmt.Sprintf("Started build %s: gradlew %s", b.ID, strings.Join(cmd.Args[1:], " ")))
+	}
 
 	// --- Security: enforce build timeout ---
 	timeout := bm.policy.MaxBuildDuration
@@ -501,38 +741,92 @@ func (bm *BuildManager) runBuild(b *Build, wsDir, artifactDir string) {
 }
 
 // collectArtifacts copies build outputs from the workspace to the artifact dir.
+// If b.ArtifactDirs is set, those dirs are scanned instead of the default
+// Gradle build/outputs paths.
 func (bm *BuildManager) collectArtifacts(b *Build, wsDir, artifactDir string) {
-	outputsDir := filepath.Join(wsDir, "build", "outputs")
-	if _, err := os.Stat(outputsDir); err != nil {
-		// Also check app/build/outputs (common Android layout).
-		outputsDir = filepath.Join(wsDir, "app", "build", "outputs")
-		if _, err := os.Stat(outputsDir); err != nil {
-			return
+	var outputDirs []string
+
+	if len(b.ArtifactDirs) > 0 {
+		// Use explicitly specified artifact directories.
+		for _, relDir := range b.ArtifactDirs {
+			absDir, err := safeSubpath(wsDir, relDir)
+			if err != nil {
+				continue
+			}
+			if dirExists(absDir) {
+				outputDirs = append(outputDirs, absDir)
+			}
+		}
+	} else {
+		// Default Gradle behavior: scan build/outputs.
+		if dir := filepath.Join(wsDir, "build", "outputs"); dirExists(dir) {
+			outputDirs = append(outputDirs, dir)
+		}
+		// Submodule build/outputs: scan top-level subdirectories only.
+		entries, err := os.ReadDir(wsDir)
+		if err == nil {
+			for _, e := range entries {
+				if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+					continue
+				}
+				if dir := filepath.Join(wsDir, e.Name(), "build", "outputs"); dirExists(dir) {
+					outputDirs = append(outputDirs, dir)
+				}
+			}
 		}
 	}
 
+	if len(outputDirs) == 0 {
+		return
+	}
+
+	// When using explicit artifact dirs, preserve the full path relative to
+	// the workspace root so that directory structure (e.g. dist/android/jniLibs/arm64-v8a/)
+	// is maintained in the artifact output.
+	relBase := ""
+	if len(b.ArtifactDirs) > 0 {
+		relBase = wsDir
+	}
+
 	var artifacts []string
-	_ = filepath.Walk(outputsDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil
+	for _, outputsDir := range outputDirs {
+		base := outputsDir
+		if relBase != "" {
+			base = relBase
 		}
-		if info.IsDir() {
-			return nil
-		}
-		// Copy APKs and AABs.
-		ext := strings.ToLower(filepath.Ext(info.Name()))
-		if ext == ".apk" || ext == ".aab" {
-			dst := filepath.Join(artifactDir, info.Name())
-			if copyFile(path, dst) == nil {
-				artifacts = append(artifacts, info.Name())
+		_ = filepath.Walk(outputsDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil
 			}
-		}
-		return nil
-	})
+			if info.IsDir() {
+				return nil
+			}
+			ext := strings.ToLower(filepath.Ext(info.Name()))
+			if ext == ".apk" || ext == ".aab" || ext == ".aar" || ext == ".so" {
+				relPath, err := filepath.Rel(base, path)
+				if err != nil {
+					return nil
+				}
+				dst := filepath.Join(artifactDir, relPath)
+				if err := os.MkdirAll(filepath.Dir(dst), 0o775); err != nil {
+					return nil
+				}
+				if copyFile(path, dst) == nil {
+					artifacts = append(artifacts, relPath)
+				}
+			}
+			return nil
+		})
+	}
 
 	b.mu.Lock()
 	b.Artifacts = artifacts
 	b.mu.Unlock()
+}
+
+func dirExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
 }
 
 func copyFile(src, dst string) error {
