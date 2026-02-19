@@ -117,7 +117,7 @@ if $REBUILD_CONTAINERS; then
         echo ""
         echo "--- Container doctor checks ---"
         sleep 3
-        for c in claude claude-ndk; do
+        for c in claude-dev claude-ndk; do
             if docker ps --format '{{.Names}}' | grep -q "^${c}$"; then
                 echo "  $c:"
                 docker exec "$c" orbital doctor 2>&1 | grep "Summary:"
@@ -127,7 +127,7 @@ if $REBUILD_CONTAINERS; then
 else
     echo "--- Skipping container rebuild (use --rebuild-containers to include) ---"
     echo "  To hot-patch running containers:"
-    echo "    docker cp ~/Dev/containers/claude-dev/orbital-client claude:/usr/local/bin/orbital"
+    echo "    docker cp ~/Dev/containers/claude-dev/orbital-client claude-dev:/usr/local/bin/orbital"
     echo "    docker cp ~/Dev/containers/claude-dev/orbital-client claude-ndk:/usr/local/bin/orbital"
 fi
 
