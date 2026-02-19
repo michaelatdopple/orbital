@@ -994,11 +994,12 @@ func (bm *BuildManager) handleGetBuildLogs(w http.ResponseWriter, r *http.Reques
 	b.mu.Lock()
 	isDone := b.Status != StatusBuilding
 	status := b.Status
+	exitCode := b.ExitCode
 	artifacts := b.Artifacts
 	b.mu.Unlock()
 
 	if isDone {
-		sendCompleteEvent(w, status, artifacts)
+		sendCompleteEvent(w, status, exitCode, artifacts)
 		flusher.Flush()
 		return
 	}
@@ -1013,9 +1014,10 @@ func (bm *BuildManager) handleGetBuildLogs(w http.ResponseWriter, r *http.Reques
 				// Channel closed — build finished.
 				b.mu.Lock()
 				status = b.Status
+				exitCode = b.ExitCode
 				artifacts = b.Artifacts
 				b.mu.Unlock()
-				sendCompleteEvent(w, status, artifacts)
+				sendCompleteEvent(w, status, exitCode, artifacts)
 				flusher.Flush()
 				return
 			}
@@ -1029,10 +1031,11 @@ func (bm *BuildManager) handleGetBuildLogs(w http.ResponseWriter, r *http.Reques
 	}
 }
 
-func sendCompleteEvent(w http.ResponseWriter, status BuildStatus, artifacts []string) {
+func sendCompleteEvent(w http.ResponseWriter, status BuildStatus, exitCode int, artifacts []string) {
 	data, _ := json.Marshal(map[string]interface{}{
 		"event":     "complete",
 		"status":    status,
+		"exit_code": exitCode,
 		"artifacts": artifacts,
 	})
 	fmt.Fprintf(w, "data: %s\n\n", data)
