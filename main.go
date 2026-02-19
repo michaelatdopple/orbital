@@ -46,7 +46,7 @@ func main() {
 	// -----------------------------------------------------------------------
 	// Ensure base directories exist
 	// -----------------------------------------------------------------------
-	for _, sub := range []string{"workspaces", "artifacts"} {
+	for _, sub := range []string{"workspaces", "artifacts", "deps"} {
 		dir := filepath.Join(*baseDir, sub)
 		if err := os.MkdirAll(dir, 0o775); err != nil {
 			log.Fatalf("failed to create directory %s: %v", dir, err)
@@ -87,7 +87,7 @@ func main() {
 	// -----------------------------------------------------------------------
 	bm := NewBuildManager(*baseDir, policy, audit)
 	wm := NewWorkspaceManager(*baseDir)
-	doc := NewDoctorManager(*baseDir)
+	doc := NewDoctorManager(*baseDir, *configFile)
 
 	// Start the background cleanup goroutine.
 	cleanupDone := make(chan struct{})
