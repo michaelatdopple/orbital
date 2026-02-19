@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -40,6 +41,9 @@ type SecurityPolicy struct {
 	// Block symlinks in workspaces.
 	BlockSymlinks bool
 
+	// Allowed git host domains for dependency resolution.
+	AllowedGitDomains []string
+
 	// Audit log file path (append-only).
 	AuditLogPath string
 }
@@ -73,8 +77,9 @@ func DefaultPolicy() *SecurityPolicy {
 			`(?i)--init-script`,
 			`(?i)-I\b`,
 		}),
-		BlockSymlinks: true,
-		AuditLogPath:  "", // Set via config; empty = log to stdout only
+		BlockSymlinks:     true,
+		AllowedGitDomains: []string{"github.com", "gitlab.com"},
+		AuditLogPath:      "", // Set via config; empty = log to stdout only
 	}
 }
 
@@ -96,15 +101,32 @@ func compileBlockedPatterns(patterns []string) []*regexp.Regexp {
 // ---------------------------------------------------------------------------
 
 // ValidatePreBuild checks that all pre-build commands are in the allowlist.
+// Supports bare commands ("npm install") and subdirectory-scoped commands
+// ("cd gallery && npm install") where the subdir is a safe relative path.
 func (sp *SecurityPolicy) ValidatePreBuild(commands []string) error {
+	// Pattern: cd <relative-path-no-dots> && <command>
+	cdPattern := regexp.MustCompile(`^cd\s+([a-zA-Z0-9_./-]+)\s+&&\s+(.+)$`)
+
 	for _, cmd := range commands {
 		cmd = strings.TrimSpace(cmd)
 		if cmd == "" {
 			continue
 		}
+
+		// Check if it's a cd <subdir> && <command> form.
+		cmdToCheck := cmd
+		if m := cdPattern.FindStringSubmatch(cmd); m != nil {
+			subdir := m[1]
+			// Block path traversal.
+			if strings.Contains(subdir, "..") {
+				return fmt.Errorf("pre_build command not allowed: %q (path traversal blocked)", cmd)
+			}
+			cmdToCheck = strings.TrimSpace(m[2])
+		}
+
 		allowed := false
 		for _, prefix := range sp.AllowedPreBuild {
-			if cmd == prefix || strings.HasPrefix(cmd, prefix+" ") {
+			if cmdToCheck == prefix || strings.HasPrefix(cmdToCheck, prefix+" ") {
 				allowed = true
 				break
 			}
@@ -139,6 +161,93 @@ func (sp *SecurityPolicy) ValidateTasks(tasks []string) error {
 		}
 	}
 	return nil
+}
+
+// ValidateDeps checks that dependency specs are safe.
+// Env var names must be uppercase with underscores, git URLs must be HTTPS on
+// an allowed domain, and refs must be simple branch/tag names.
+func (sp *SecurityPolicy) ValidateDeps(deps map[string]DepSpec) error {
+	envVarPat := regexp.MustCompile(`^[A-Z_][A-Z0-9_]*$`)
+	refPat := regexp.MustCompile(`^[a-zA-Z0-9._/-]+$`)
+
+	for name, dep := range deps {
+		// Validate env var name.
+		if !envVarPat.MatchString(name) {
+			return fmt.Errorf("invalid dep env var name %q: must match [A-Z_][A-Z0-9_]*", name)
+		}
+
+		// Validate git URL: must be https:// on allowed domain.
+		if !strings.HasPrefix(dep.Git, "https://") {
+			return fmt.Errorf("dep %q: git URL must use https:// (got %q)", name, dep.Git)
+		}
+		parsed, err := url.Parse(dep.Git)
+		if err != nil {
+			return fmt.Errorf("dep %q: invalid git URL %q: %w", name, dep.Git, err)
+		}
+		host := strings.ToLower(parsed.Hostname())
+		allowed := false
+		for _, d := range sp.AllowedGitDomains {
+			if host == d {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return fmt.Errorf("dep %q: git host %q not in allowed domains %v", name, host, sp.AllowedGitDomains)
+		}
+
+		// Validate ref.
+		if dep.Ref == "" {
+			return fmt.Errorf("dep %q: ref is required", name)
+		}
+		if !refPat.MatchString(dep.Ref) {
+			return fmt.Errorf("dep %q: invalid ref %q: must match [a-zA-Z0-9._/-]+", name, dep.Ref)
+		}
+	}
+	return nil
+}
+
+// ValidateArtifactDirs checks that artifact directory paths are safe relative paths.
+func (sp *SecurityPolicy) ValidateArtifactDirs(dirs []string) error {
+	for _, dir := range dirs {
+		if strings.Contains(dir, "..") {
+			return fmt.Errorf("artifact_dir must not contain '..': %q", dir)
+		}
+		if filepath.IsAbs(dir) {
+			return fmt.Errorf("artifact_dir must be a relative path: %q", dir)
+		}
+	}
+	return nil
+}
+
+// ResolveSigningProfile looks up a signing profile from environment variables
+// and returns the env vars to inject into the build process. Profile names are
+// validated as ^[a-zA-Z0-9_-]+$ and mapped to SIGNING_<UPPER>_KEYSTORE etc.
+func (sp *SecurityPolicy) ResolveSigningProfile(profile string) ([]string, error) {
+	profilePat := regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+	if !profilePat.MatchString(profile) {
+		return nil, fmt.Errorf("invalid signing profile name %q", profile)
+	}
+
+	prefix := "SIGNING_" + strings.ToUpper(profile) + "_"
+	keystore := os.Getenv(prefix + "KEYSTORE")
+	if keystore == "" {
+		return nil, fmt.Errorf("signing profile %q not configured (missing %sKEYSTORE)", profile, prefix)
+	}
+	if _, err := os.Stat(keystore); err != nil {
+		return nil, fmt.Errorf("signing profile %q: keystore not found at %s", profile, keystore)
+	}
+
+	storePass := os.Getenv(prefix + "KEYSTORE_PASSWORD")
+	keyAlias := os.Getenv(prefix + "KEY_ALIAS")
+	keyPass := os.Getenv(prefix + "KEY_PASSWORD")
+
+	return []string{
+		"SIGNING_KEYSTORE_PATH=" + keystore,
+		"SIGNING_KEYSTORE_PASSWORD=" + storePass,
+		"SIGNING_KEY_ALIAS=" + keyAlias,
+		"SIGNING_KEY_PASSWORD=" + keyPass,
+	}, nil
 }
 
 // VerifyGradleWrapper checks the Gradle wrapper jar's SHA-256.

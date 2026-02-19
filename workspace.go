@@ -40,6 +40,10 @@ func (wm *WorkspaceManager) artifactsDir() string {
 	return filepath.Join(wm.baseDir, "artifacts")
 }
 
+func (wm *WorkspaceManager) depsDir() string {
+	return filepath.Join(wm.baseDir, "deps")
+}
+
 // ---------------------------------------------------------------------------
 // ListWorkspaces
 // ---------------------------------------------------------------------------
@@ -218,6 +222,9 @@ func (wm *WorkspaceManager) runCleanup() {
 		log.Printf("cleanup: removed %d stale workspaces (>14 days)", pruned)
 	}
 
+	// 4. Prune dep cache entries older than 30 days.
+	wm.pruneDepCache(30 * 24 * time.Hour)
+
 	log.Println("cleanup: periodic cleanup complete")
 }
 
@@ -270,6 +277,35 @@ func (wm *WorkspaceManager) pruneWorkspaceBuildDirs(maxAge time.Duration) {
 				log.Printf("cleanup: failed to remove build dir in %s: %v", e.Name(), err)
 			} else {
 				log.Printf("cleanup: removed stale build dir in workspace %s", e.Name())
+			}
+		}
+	}
+}
+
+func (wm *WorkspaceManager) pruneDepCache(maxAge time.Duration) {
+	dir := wm.depsDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+
+	cutoff := time.Now().Add(-maxAge)
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().Before(cutoff) {
+			depPath := filepath.Join(dir, e.Name())
+			lockPath := depPath + ".lock"
+			if err := os.RemoveAll(depPath); err != nil {
+				log.Printf("cleanup: failed to remove stale dep cache %s: %v", e.Name(), err)
+			} else {
+				_ = os.Remove(lockPath)
+				log.Printf("cleanup: removed stale dep cache %s (>30 days)", e.Name())
 			}
 		}
 	}

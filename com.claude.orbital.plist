@@ -34,7 +34,7 @@
         <key>HOME</key>
         <string>/opt/orbital</string>
         <key>PATH</key>
-        <string>/opt/orbital/bin:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <string>/opt/orbital/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/opt/homebrew/bin</string>
     </dict>
 
     <!-- Start at boot, restart on crash -->

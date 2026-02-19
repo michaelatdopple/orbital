@@ -758,11 +758,12 @@ func (bm *BuildManager) collectArtifacts(b *Build, wsDir, artifactDir string) {
 			}
 		}
 	} else {
-		// Default Gradle behavior: scan build/outputs.
+		seen := map[string]bool{}
+		// Default Gradle behavior: scan root build/outputs.
 		if dir := filepath.Join(wsDir, "build", "outputs"); dirExists(dir) {
 			outputDirs = append(outputDirs, dir)
 		}
-		// Submodule build/outputs: scan top-level subdirectories only.
+		// Top-level submodule build/outputs (e.g. app/, library/).
 		entries, err := os.ReadDir(wsDir)
 		if err == nil {
 			for _, e := range entries {
@@ -770,6 +771,23 @@ func (bm *BuildManager) collectArtifacts(b *Build, wsDir, artifactDir string) {
 					continue
 				}
 				if dir := filepath.Join(wsDir, e.Name(), "build", "outputs"); dirExists(dir) {
+					outputDirs = append(outputDirs, dir)
+					seen[e.Name()] = true
+				}
+			}
+		}
+		// Infer deeper module output dirs from task names.
+		// e.g. :examples:gesture-forge:assembleDebug → examples/gesture-forge/build/outputs/
+		for _, task := range b.Tasks {
+			task = strings.TrimPrefix(task, ":")
+			parts := strings.Split(task, ":")
+			if len(parts) > 1 {
+				modulePath := filepath.Join(parts[:len(parts)-1]...)
+				if seen[modulePath] {
+					continue
+				}
+				seen[modulePath] = true
+				if dir := filepath.Join(wsDir, modulePath, "build", "outputs"); dirExists(dir) {
 					outputDirs = append(outputDirs, dir)
 				}
 			}

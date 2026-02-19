@@ -16,6 +16,12 @@ import (
 	"time"
 )
 
+// Set at build time via -ldflags.
+var (
+	version = "dev"
+	commit  = "unknown"
+)
+
 func main() {
 	// -----------------------------------------------------------------------
 	// Flags
@@ -159,7 +165,7 @@ func main() {
 
 	// Health check.
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "version": version, "commit": commit})
 	})
 
 	// -----------------------------------------------------------------------

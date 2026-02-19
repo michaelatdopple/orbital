@@ -49,9 +49,13 @@ PLIST_DST      := /Library/LaunchDaemons/$(PLIST_NAME)
 # ---------------------------------------------------------------------------
 # build — compile the Go binary (LLM-safe, no signing)
 # ---------------------------------------------------------------------------
+VERSION        := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
+COMMIT         := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+LDFLAGS        := -X main.version=$(VERSION) -X main.commit=$(COMMIT)
+
 build:
-	go build -o $(BINARY) .
-	@echo "✓ Built ./$(BINARY) (unsigned)"
+	go build -ldflags "$(LDFLAGS)" -o $(BINARY) .
+	@echo "✓ Built ./$(BINARY) $(VERSION) ($(COMMIT), unsigned)"
 
 # ---------------------------------------------------------------------------
 # sign — code-sign the binary (HUMAN ONLY — interactive prompt)
