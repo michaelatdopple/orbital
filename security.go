@@ -46,6 +46,22 @@ type SecurityPolicy struct {
 
 	// Audit log file path (append-only).
 	AuditLogPath string
+
+	// --- Compute delegation security ---
+
+	// Allowed interpreter commands for compute jobs (first token of command).
+	AllowedComputeCommands []string
+
+	// Blocked interpreter flags that enable inline code execution.
+	BlockedComputeFlags []string
+
+	// Allowed file extensions for compute artifacts (separate from build artifacts).
+	AllowedComputeArtifactExts []string
+
+	// Resource limits for compute processes.
+	ComputeMemoryLimitBytes int64 // RLIMIT_AS
+	ComputeFileSizeLimitBytes int64 // RLIMIT_FSIZE
+	ComputeMaxProcesses       int64 // RLIMIT_NPROC
 }
 
 // DefaultPolicy returns a security policy suitable for untrusted code.
@@ -80,6 +96,27 @@ func DefaultPolicy() *SecurityPolicy {
 		BlockSymlinks:     true,
 		AllowedGitDomains: []string{"github.com", "gitlab.com"},
 		AuditLogPath:      "", // Set via config; empty = log to stdout only
+
+		// Compute delegation defaults.
+		AllowedComputeCommands: []string{"python3", "python", "node", "bash"},
+		BlockedComputeFlags: []string{
+			"-c",        // python -c, bash -c (inline code execution)
+			"-e",        // node -e (eval)
+			"-m",        // python -m (run modules as scripts)
+			"--eval",    // node --eval
+			"--require", // node --require (load arbitrary modules)
+			"--import",  // node --import
+			"-i",        // interactive mode
+			"-W",        // python warnings (can be abused for code paths)
+		},
+		AllowedComputeArtifactExts: []string{
+			".usearch", ".json", ".csv", ".bin",
+			".onnx", ".npy", ".npz", ".safetensors",
+			".txt", ".log",
+		},
+		ComputeMemoryLimitBytes:   8 * 1024 * 1024 * 1024, // 8 GB
+		ComputeFileSizeLimitBytes: 2 * 1024 * 1024 * 1024, // 2 GB
+		ComputeMaxProcesses:       64,
 	}
 }
 
@@ -218,6 +255,202 @@ func (sp *SecurityPolicy) ValidateArtifactDirs(dirs []string) error {
 		}
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Compute security guards
+// ---------------------------------------------------------------------------
+
+// shellMetacharacters are characters that indicate shell injection attempts.
+var shellMetacharacters = []string{"|", ";", "&&", "||", "`", "$(", ">", "<", "&", "\n", "\r"}
+
+// ValidateComputeCommand validates a compute command string.
+// Checks: first token in allowlist, no shell metacharacters, no blocked flags,
+// file arguments are relative within workspace, bash requires .sh script file.
+func (sp *SecurityPolicy) ValidateComputeCommand(command string, wsDir string) error {
+	if command == "" {
+		return fmt.Errorf("compute command is required")
+	}
+
+	// Check for shell metacharacters.
+	for _, meta := range shellMetacharacters {
+		if strings.Contains(command, meta) {
+			return fmt.Errorf("compute command contains blocked shell metacharacter %q", meta)
+		}
+	}
+
+	// Split into tokens.
+	args := strings.Fields(command)
+	if len(args) == 0 {
+		return fmt.Errorf("compute command is empty after parsing")
+	}
+
+	// Validate first token is an allowed interpreter.
+	interpreter := args[0]
+	allowed := false
+	for _, cmd := range sp.AllowedComputeCommands {
+		if interpreter == cmd {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return fmt.Errorf("compute command %q not in allowlist %v", interpreter, sp.AllowedComputeCommands)
+	}
+
+	// Validate no blocked interpreter flags.
+	for _, arg := range args[1:] {
+		for _, blocked := range sp.BlockedComputeFlags {
+			if arg == blocked {
+				return fmt.Errorf("compute command contains blocked flag %q (prevents inline code execution)", blocked)
+			}
+		}
+	}
+
+	// Validate file-like arguments: must be relative, no traversal, no absolute paths.
+	for _, arg := range args[1:] {
+		if strings.HasPrefix(arg, "-") {
+			continue // skip flags
+		}
+		if filepath.IsAbs(arg) {
+			return fmt.Errorf("compute command argument must be relative path: %q", arg)
+		}
+		if strings.Contains(arg, "..") {
+			return fmt.Errorf("compute command argument must not contain '..': %q", arg)
+		}
+	}
+
+	// Bash-specific: second token must be a .sh file that exists in the workspace.
+	if interpreter == "bash" {
+		if len(args) < 2 {
+			return fmt.Errorf("bash compute command requires a script file argument")
+		}
+		scriptArg := args[1]
+		if !strings.HasSuffix(scriptArg, ".sh") {
+			return fmt.Errorf("bash compute command requires a .sh script file, got %q", scriptArg)
+		}
+		if wsDir != "" {
+			scriptPath := filepath.Join(wsDir, scriptArg)
+			if _, err := os.Stat(scriptPath); err != nil {
+				return fmt.Errorf("bash script not found in workspace: %s", scriptArg)
+			}
+		}
+	}
+
+	return nil
+}
+
+// IsAllowedComputeArtifact checks if a filename has an allowed extension for
+// compute artifacts. Returns false for extensions that could contain executable
+// code or be used for data exfiltration (.py, .sh, .so, .dylib).
+func (sp *SecurityPolicy) IsAllowedComputeArtifact(filename string) bool {
+	ext := strings.ToLower(filepath.Ext(filename))
+	for _, allowed := range sp.AllowedComputeArtifactExts {
+		if ext == allowed {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidateRequirementsPath checks that a requirements file path is safe.
+func (sp *SecurityPolicy) ValidateRequirementsPath(reqPath string) error {
+	if reqPath == "" {
+		return nil
+	}
+	if filepath.IsAbs(reqPath) {
+		return fmt.Errorf("requirements path must be relative: %q", reqPath)
+	}
+	if strings.Contains(reqPath, "..") {
+		return fmt.Errorf("requirements path must not contain '..': %q", reqPath)
+	}
+	return nil
+}
+
+// ComputeEnvironment builds a minimal environment for compute processes.
+// This MUST be used instead of os.Environ() to prevent secret leakage.
+// No SIGNING_* secrets, no API keys, no real HOME directory.
+func ComputeEnvironment(wsDir, tmpDir, venvDir string) []string {
+	env := []string{
+		"PATH=/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin",
+		"HOME=" + wsDir,
+		"TMPDIR=" + tmpDir,
+		"PYTHONPATH=",
+		"LANG=en_US.UTF-8",
+	}
+	if venvDir != "" {
+		env = append(env, "VIRTUAL_ENV="+venvDir)
+		// Prepend venv bin to PATH.
+		env[0] = "PATH=" + filepath.Join(venvDir, "bin") + ":/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin"
+	}
+	return env
+}
+
+// GenerateSandboxProfile creates a macOS sandbox-exec profile that restricts
+// compute processes to their workspace, venv, and system libraries only.
+// This is the primary defense: even if all other checks fail, the sandbox
+// confines the process.
+func GenerateSandboxProfile(wsDir, venvDir, tmpDir string) string {
+	profile := `(version 1)
+(deny default)
+
+;; Read access: workspace, system libs, interpreters
+(allow file-read* (subpath "` + wsDir + `"))
+(allow file-read* (subpath "/usr/lib"))
+(allow file-read* (subpath "/usr/bin"))
+(allow file-read* (subpath "/usr/local/lib"))
+(allow file-read* (subpath "/usr/local/bin"))
+(allow file-read* (subpath "/opt/homebrew"))
+(allow file-read* (subpath "/System/Library"))
+(allow file-read* (subpath "/Library/Frameworks"))
+(allow file-read* (subpath "/dev/urandom"))
+(allow file-read* (subpath "/dev/null"))
+(allow file-read* (subpath "/private/var/db"))
+
+;; Write access: workspace and temp only
+(allow file-write* (subpath "` + wsDir + `"))
+(allow file-write* (subpath "` + tmpDir + `"))
+(allow file-write* (literal "/dev/null"))
+
+;; Temp dir read access
+(allow file-read* (subpath "` + tmpDir + `"))
+
+;; Process execution (for python3, node, etc.)
+(allow process-exec)
+(allow process-fork)
+
+;; Allow sysctl reads (required by Python, Node)
+(allow sysctl-read)
+
+;; Allow mach lookups (required for CoreML, Metal)
+(allow mach-lookup)
+
+;; Block network access (no exfiltration, no reverse shells)
+(deny network*)
+
+;; Block home directory access
+(deny file-read* (subpath (user-home-path)))
+(deny file-write* (subpath (user-home-path)))
+`
+	// Add venv read access if specified.
+	if venvDir != "" {
+		profile += `
+;; Venv read/exec access
+(allow file-read* (subpath "` + venvDir + `"))
+`
+	}
+
+	return profile
+}
+
+// ComputeResourceLimitArgs returns ulimit shell arguments for resource-limiting
+// compute processes. These are applied via a wrapper since macOS Go doesn't
+// support SysProcAttr.Rlimits.
+func (sp *SecurityPolicy) ComputeResourceLimitArgs() string {
+	memKB := sp.ComputeMemoryLimitBytes / 1024
+	fileKB := sp.ComputeFileSizeLimitBytes / 1024
+	nproc := sp.ComputeMaxProcesses
+	return fmt.Sprintf("ulimit -v %d && ulimit -f %d && ulimit -u %d", memKB, fileKB, nproc)
 }
 
 // ResolveSigningProfile looks up a signing profile from environment variables

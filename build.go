@@ -57,6 +57,8 @@ type Build struct {
 	Deps           map[string]DepSpec  `json:"deps,omitempty"`
 	ArtifactDirs   []string            `json:"artifact_dirs,omitempty"`
 	SigningProfile string              `json:"signing_profile,omitempty"`
+	ComputeCommand string              `json:"compute_command,omitempty"`
+	Requirements   string              `json:"requirements,omitempty"`
 	ExitCode       int                 `json:"exit_code"`
 	StartedAt    time.Time           `json:"started_at"`
 	FinishedAt   time.Time           `json:"finished_at,omitempty"`
@@ -130,6 +132,7 @@ type BuildManager struct {
 	policy  *SecurityPolicy
 	limiter *BuildLimiter
 	audit   *AuditLogger
+	venvMgr *VenvManager
 }
 
 // NewBuildManager creates a new manager rooted at baseDir with security policy.
@@ -140,6 +143,7 @@ func NewBuildManager(baseDir string, policy *SecurityPolicy, audit *AuditLogger)
 		policy:  policy,
 		limiter: NewBuildLimiter(policy.MaxConcurrentBuilds),
 		audit:   audit,
+		venvMgr: NewVenvManager(baseDir),
 	}
 }
 
@@ -209,6 +213,8 @@ type BuildRequest struct {
 	Deps           map[string]DepSpec `json:"deps,omitempty"`
 	ArtifactDirs   []string           `json:"artifact_dirs,omitempty"`
 	SigningProfile string             `json:"signing_profile,omitempty"`
+	ComputeCommand string             `json:"compute_command,omitempty"`
+	Requirements   string             `json:"requirements,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -226,8 +232,8 @@ func (bm *BuildManager) StartBuild(req BuildRequest) (*Build, error) {
 	if buildType == "" {
 		buildType = "gradle"
 	}
-	if buildType != "gradle" && buildType != "script" {
-		return nil, fmt.Errorf("invalid build_type %q: must be \"gradle\" or \"script\"", buildType)
+	if buildType != "gradle" && buildType != "script" && buildType != "compute" {
+		return nil, fmt.Errorf("invalid build_type %q: must be \"gradle\", \"script\", or \"compute\"", buildType)
 	}
 
 	// Type-specific validation.
@@ -264,6 +270,20 @@ func (bm *BuildManager) StartBuild(req BuildRequest) (*Build, error) {
 		// Block path traversal in script path.
 		if strings.Contains(req.BuildScript, "..") {
 			return nil, fmt.Errorf("build_script must not contain '..'")
+		}
+
+	case "compute":
+		if req.ComputeCommand == "" {
+			return nil, fmt.Errorf("compute_command is required for compute builds")
+		}
+		// Validate requirements path if specified.
+		if err := bm.policy.ValidateRequirementsPath(req.Requirements); err != nil {
+			bm.audit.Log("build_rejected", map[string]string{
+				"reason":    "invalid_requirements_path",
+				"workspace": req.Workspace,
+				"error":     err.Error(),
+			})
+			return nil, err
 		}
 	}
 
@@ -387,6 +407,31 @@ func (bm *BuildManager) StartBuild(req BuildRequest) (*Build, error) {
 			bm.limiter.Release()
 			return nil, fmt.Errorf("build script is not executable: %s", req.BuildScript)
 		}
+
+	case "compute":
+		// --- Security: validate compute command (allowlist, flags, paths) ---
+		if err := bm.policy.ValidateComputeCommand(req.ComputeCommand, wsDir); err != nil {
+			bm.limiter.Release()
+			bm.audit.Log("build_rejected", map[string]string{
+				"reason":    "invalid_compute_command",
+				"workspace": req.Workspace,
+				"command":   req.ComputeCommand,
+				"error":     err.Error(),
+			})
+			return nil, err
+		}
+		// Verify requirements file exists if specified.
+		if req.Requirements != "" {
+			reqPath, err := safeSubpath(wsDir, req.Requirements)
+			if err != nil {
+				bm.limiter.Release()
+				return nil, fmt.Errorf("requirements path error: %w", err)
+			}
+			if _, err := os.Stat(reqPath); err != nil {
+				bm.limiter.Release()
+				return nil, fmt.Errorf("requirements file not found: %s", req.Requirements)
+			}
+		}
 	}
 
 	// Generate build ID.
@@ -420,6 +465,8 @@ func (bm *BuildManager) StartBuild(req BuildRequest) (*Build, error) {
 		Deps:           req.Deps,
 		ArtifactDirs:   req.ArtifactDirs,
 		SigningProfile: req.SigningProfile,
+		ComputeCommand: req.ComputeCommand,
+		Requirements:   req.Requirements,
 		StartedAt:      time.Now(),
 		ArtifactDir:  filepath.Join("orbital", "artifacts", id, "out"),
 		done:         make(chan struct{}),
@@ -574,9 +621,16 @@ func (bm *BuildManager) runBuild(b *Build, wsDir, artifactDir string) {
 
 	var cmd *exec.Cmd
 	switch b.BuildType {
+	case "compute":
+		cmd = bm.buildComputeCmd(b, wsDir)
+		if cmd == nil {
+			return // error already logged and status set
+		}
+
 	case "script":
 		cmd = exec.Command(filepath.Join(wsDir, b.BuildScript))
 		cmd.Dir = wsDir
+
 	default: // "gradle"
 		args := make([]string, 0, len(b.Tasks)+len(b.Properties))
 		args = append(args, b.Tasks...)
@@ -585,26 +639,29 @@ func (bm *BuildManager) runBuild(b *Build, wsDir, artifactDir string) {
 		cmd.Dir = wsDir
 	}
 
-	// Resolve signing profile env vars.
-	var signingEnv []string
-	if b.SigningProfile != "" {
-		var sigErr error
-		signingEnv, sigErr = bm.policy.ResolveSigningProfile(b.SigningProfile)
-		if sigErr != nil {
-			b.addLogLine(fmt.Sprintf("ERROR: signing profile resolution failed: %v", sigErr))
-			b.mu.Lock()
-			b.Status = StatusFailed
-			b.ExitCode = 1
-			b.FinishedAt = time.Now()
-			b.mu.Unlock()
-			return
+	// Environment setup (compute uses minimal env; gradle/script use full host env).
+	if b.BuildType != "compute" {
+		// Resolve signing profile env vars.
+		var signingEnv []string
+		if b.SigningProfile != "" {
+			var sigErr error
+			signingEnv, sigErr = bm.policy.ResolveSigningProfile(b.SigningProfile)
+			if sigErr != nil {
+				b.addLogLine(fmt.Sprintf("ERROR: signing profile resolution failed: %v", sigErr))
+				b.mu.Lock()
+				b.Status = StatusFailed
+				b.ExitCode = 1
+				b.FinishedAt = time.Now()
+				b.mu.Unlock()
+				return
+			}
+			b.addLogLine(fmt.Sprintf("Signing profile %q: keystore loaded", b.SigningProfile))
 		}
-		b.addLogLine(fmt.Sprintf("Signing profile %q: keystore loaded", b.SigningProfile))
-	}
 
-	// Propagate environment, including resolved dep paths and signing config.
-	cmd.Env = append(os.Environ(), depEnv...)
-	cmd.Env = append(cmd.Env, signingEnv...)
+		// Propagate environment, including resolved dep paths and signing config.
+		cmd.Env = append(os.Environ(), depEnv...)
+		cmd.Env = append(cmd.Env, signingEnv...)
+	}
 
 	// Use a process group so we can kill the whole tree.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -637,6 +694,8 @@ func (bm *BuildManager) runBuild(b *Build, wsDir, artifactDir string) {
 	}
 
 	switch b.BuildType {
+	case "compute":
+		b.addLogLine(fmt.Sprintf("Started compute %s: %s", b.ID, b.ComputeCommand))
 	case "script":
 		b.addLogLine(fmt.Sprintf("Started build %s: script %s", b.ID, b.BuildScript))
 	default:
@@ -728,8 +787,12 @@ func (bm *BuildManager) runBuild(b *Build, wsDir, artifactDir string) {
 		"duration":  b.FinishedAt.Sub(b.StartedAt).String(),
 	})
 
-	// Collect artifacts (APKs and other outputs).
-	bm.collectArtifacts(b, wsDir, artifactDir)
+	// Collect artifacts.
+	if b.BuildType == "compute" {
+		bm.collectComputeArtifacts(b, wsDir, artifactDir)
+	} else {
+		bm.collectArtifacts(b, wsDir, artifactDir)
+	}
 
 	// Close subscriber channels.
 	b.mu.Lock()
@@ -864,6 +927,143 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	return out.Close()
+}
+
+// ---------------------------------------------------------------------------
+// Compute execution
+// ---------------------------------------------------------------------------
+
+// buildComputeCmd constructs the sandbox-exec command for a compute job.
+// Sets up venv if requirements are specified, builds minimal environment,
+// generates sandbox profile, and wraps the command with resource limits.
+// Returns nil (and sets build status to failed) on error.
+func (bm *BuildManager) buildComputeCmd(b *Build, wsDir string) *exec.Cmd {
+	// Create a scoped temp dir for this compute job.
+	computeTmpDir := filepath.Join(os.TempDir(), fmt.Sprintf("orbital-compute-%s", b.ID))
+	if err := os.MkdirAll(computeTmpDir, 0o700); err != nil {
+		b.addLogLine(fmt.Sprintf("ERROR: failed to create compute temp dir: %v", err))
+		b.mu.Lock()
+		b.Status = StatusFailed
+		b.ExitCode = -1
+		b.FinishedAt = time.Now()
+		b.mu.Unlock()
+		return nil
+	}
+
+	// Handle requirements / venv setup.
+	var venvDir string
+	if b.Requirements != "" {
+		reqPath := filepath.Join(wsDir, b.Requirements)
+		logFn := func(msg string) { b.addLogLine(msg) }
+		var err error
+		venvDir, err = bm.venvMgr.EnsureVenv(b.Workspace, reqPath, logFn)
+		if err != nil {
+			b.addLogLine(fmt.Sprintf("ERROR: venv setup failed: %v", err))
+			b.mu.Lock()
+			b.Status = StatusFailed
+			b.ExitCode = 1
+			b.FinishedAt = time.Now()
+			b.mu.Unlock()
+			return nil
+		}
+	}
+
+	// Build minimal environment (no host env leakage).
+	env := ComputeEnvironment(wsDir, computeTmpDir, venvDir)
+
+	// Generate sandbox profile.
+	sandboxProfile := GenerateSandboxProfile(wsDir, venvDir, computeTmpDir)
+
+	// Write sandbox profile to temp file.
+	profilePath := filepath.Join(computeTmpDir, "sandbox.sb")
+	if err := os.WriteFile(profilePath, []byte(sandboxProfile), 0o600); err != nil {
+		b.addLogLine(fmt.Sprintf("ERROR: failed to write sandbox profile: %v", err))
+		b.mu.Lock()
+		b.Status = StatusFailed
+		b.ExitCode = -1
+		b.FinishedAt = time.Now()
+		b.mu.Unlock()
+		return nil
+	}
+
+	// Build the command with resource limits and sandbox.
+	// We use sandbox-exec -f <profile> sh -c '<ulimits> && exec <command>'
+	// The sh wrapper is host-controlled (not container input), so shell
+	// metacharacters in the user command have already been rejected.
+	resourceLimits := bm.policy.ComputeResourceLimitArgs()
+	computeArgs := strings.Fields(b.ComputeCommand)
+	quotedArgs := make([]string, len(computeArgs))
+	for i, arg := range computeArgs {
+		quotedArgs[i] = shellQuote(arg)
+	}
+	innerCmd := resourceLimits + " && exec " + strings.Join(quotedArgs, " ")
+
+	cmd := exec.Command("sandbox-exec", "-f", profilePath, "sh", "-c", innerCmd)
+	cmd.Dir = wsDir
+	cmd.Env = env
+
+	b.addLogLine(fmt.Sprintf("Sandbox: %s", filepath.Base(profilePath)))
+	b.addLogLine(fmt.Sprintf("Environment: minimal (%d vars, HOME=%s)", len(env), wsDir))
+	if venvDir != "" {
+		b.addLogLine(fmt.Sprintf("Venv: %s", filepath.Base(venvDir)))
+	}
+
+	return cmd
+}
+
+// shellQuote wraps a string in single quotes for safe shell embedding.
+// Single quotes inside the string are handled by ending the quote, adding
+// an escaped single quote, and reopening the quote.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+
+// collectComputeArtifacts copies compute outputs using the compute artifact
+// type allowlist (only safe data formats, no executables).
+func (bm *BuildManager) collectComputeArtifacts(b *Build, wsDir, artifactDir string) {
+	if len(b.ArtifactDirs) == 0 {
+		return
+	}
+
+	var artifacts []string
+	for _, relDir := range b.ArtifactDirs {
+		absDir, err := safeSubpath(wsDir, relDir)
+		if err != nil {
+			continue
+		}
+		if !dirExists(absDir) {
+			continue
+		}
+
+		_ = filepath.Walk(absDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil || info.IsDir() {
+				return nil
+			}
+
+			// Type-filtered: only allow safe data formats.
+			if !bm.policy.IsAllowedComputeArtifact(info.Name()) {
+				b.addLogLine(fmt.Sprintf("Artifact skipped (blocked type): %s", info.Name()))
+				return nil
+			}
+
+			relPath, err := filepath.Rel(wsDir, path)
+			if err != nil {
+				return nil
+			}
+			dst := filepath.Join(artifactDir, relPath)
+			if err := os.MkdirAll(filepath.Dir(dst), 0o775); err != nil {
+				return nil
+			}
+			if copyFile(path, dst) == nil {
+				artifacts = append(artifacts, relPath)
+			}
+			return nil
+		})
+	}
+
+	b.mu.Lock()
+	b.Artifacts = artifacts
+	b.mu.Unlock()
 }
 
 // ---------------------------------------------------------------------------

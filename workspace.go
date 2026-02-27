@@ -25,11 +25,15 @@ type WorkspaceInfo struct {
 // WorkspaceManager owns workspace operations.
 type WorkspaceManager struct {
 	baseDir string
+	venvMgr *VenvManager
 }
 
 // NewWorkspaceManager creates a manager rooted at baseDir.
 func NewWorkspaceManager(baseDir string) *WorkspaceManager {
-	return &WorkspaceManager{baseDir: baseDir}
+	return &WorkspaceManager{
+		baseDir: baseDir,
+		venvMgr: NewVenvManager(baseDir),
+	}
 }
 
 func (wm *WorkspaceManager) workspacesDir() string {
@@ -224,6 +228,10 @@ func (wm *WorkspaceManager) runCleanup() {
 
 	// 4. Prune dep cache entries older than 30 days.
 	wm.pruneDepCache(30 * 24 * time.Hour)
+
+	// 5. Prune stale venvs and node_modules caches (>14 days).
+	wm.venvMgr.PruneStaleVenvs()
+	wm.venvMgr.PruneStaleNodeModules()
 
 	log.Println("cleanup: periodic cleanup complete")
 }
