@@ -51,7 +51,7 @@ echo ""
 
 # 5. Data directory (under ~/ for Docker VirtioFS compatibility)
 echo "--- Setting up data directory ---"
-sudo mkdir -p "$DATA_DIR/workspaces" "$DATA_DIR/artifacts" "$DATA_DIR/certs"
+sudo mkdir -p "$DATA_DIR/workspaces" "$DATA_DIR/artifacts" "$DATA_DIR/deps" "$DATA_DIR/venvs" "$DATA_DIR/node_modules_cache" "$DATA_DIR/certs"
 sudo chown -R orbital-guard:orbital "$DATA_DIR"
 sudo chmod 2775 "$DATA_DIR" "$DATA_DIR/workspaces" "$DATA_DIR/artifacts" "$DATA_DIR/certs"
 # Docker Desktop VirtioFS uses the host user's identity for all container file
