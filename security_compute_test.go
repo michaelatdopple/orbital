@@ -312,8 +312,8 @@ func TestGenerateSandboxProfile_Structure(t *testing.T) {
 	if !strings.Contains(profile, `(allow file-read* (subpath "/System/Library"))`) {
 		t.Error("sandbox profile missing System/Library access")
 	}
-	if !strings.Contains(profile, `(allow file-read* (subpath "/Library/Frameworks"))`) {
-		t.Error("sandbox profile missing Library/Frameworks access (CoreML)")
+	if !strings.Contains(profile, `(allow file-read* (subpath "/Library"))`) {
+		t.Error("sandbox profile missing /Library access (CommandLineTools, Frameworks, Python)")
 	}
 
 	// Must allow /private/etc for system config (DNS, hostname, etc.).

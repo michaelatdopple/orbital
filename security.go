@@ -403,7 +403,7 @@ func GenerateSandboxProfile(wsDir, venvDir, tmpDir string) string {
 (allow file-read* (subpath "/usr/local/lib"))
 (allow file-read* (subpath "/opt/homebrew"))
 (allow file-read* (subpath "/System/Library"))
-(allow file-read* (subpath "/Library/Frameworks"))
+(allow file-read* (subpath "/Library"))
 (allow file-read* (subpath "/private/etc"))
 (allow file-read* (subpath "/private/var/db"))
 (allow file-read* (literal "/dev/urandom"))
