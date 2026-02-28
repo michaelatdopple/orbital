@@ -297,13 +297,15 @@ func TestGenerateSandboxProfile_Structure(t *testing.T) {
 		t.Error("sandbox profile missing network deny")
 	}
 
-	// Must deny home directory (resolved as literal path, not Seatbelt function).
-	homeDir, _ := os.UserHomeDir()
-	if !strings.Contains(profile, `(deny file-read* (subpath "`+homeDir+`"))`) {
-		t.Error("sandbox profile missing home dir read deny")
+	// Home directory access is blocked by (deny default) — no explicit deny needed.
+	// Verify no explicit home deny exists (it would conflict with workspace allow).
+	if strings.Contains(profile, "deny file-read* (subpath \"/Users") {
+		t.Error("sandbox profile should not have explicit home dir deny (deny default covers it)")
 	}
-	if !strings.Contains(profile, `(deny file-write* (subpath "`+homeDir+`"))`) {
-		t.Error("sandbox profile missing home dir write deny")
+
+	// Must allow /bin for sh/bash.
+	if !strings.Contains(profile, `(allow file-read* (subpath "/bin"))`) {
+		t.Error("sandbox profile missing /bin access (needed for sh)")
 	}
 
 	// Must allow system libs (for CoreML, Python).
@@ -312,6 +314,11 @@ func TestGenerateSandboxProfile_Structure(t *testing.T) {
 	}
 	if !strings.Contains(profile, `(allow file-read* (subpath "/Library/Frameworks"))`) {
 		t.Error("sandbox profile missing Library/Frameworks access (CoreML)")
+	}
+
+	// Must allow /private/etc for system config (DNS, hostname, etc.).
+	if !strings.Contains(profile, `(allow file-read* (subpath "/private/etc"))`) {
+		t.Error("sandbox profile missing /private/etc access")
 	}
 
 	// Must allow process execution.

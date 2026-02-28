@@ -391,28 +391,24 @@ func ComputeEnvironment(wsDir, tmpDir, venvDir string) []string {
 // This is the primary defense: even if all other checks fail, the sandbox
 // confines the process.
 func GenerateSandboxProfile(wsDir, venvDir, tmpDir string) string {
-	// Resolve home directory for deny rules. The Seatbelt (user-home-path)
-	// function is unavailable when running as a service user, so we resolve
-	// it in Go and inject it as a string literal.
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		homeDir = "/Users"
-	}
 	profile := `(version 1)
 (deny default)
 
 ;; Read access: workspace, system libs, interpreters
 (allow file-read* (subpath "` + wsDir + `"))
-(allow file-read* (subpath "/usr/lib"))
+(allow file-read* (subpath "/bin"))
 (allow file-read* (subpath "/usr/bin"))
-(allow file-read* (subpath "/usr/local/lib"))
+(allow file-read* (subpath "/usr/lib"))
 (allow file-read* (subpath "/usr/local/bin"))
+(allow file-read* (subpath "/usr/local/lib"))
 (allow file-read* (subpath "/opt/homebrew"))
 (allow file-read* (subpath "/System/Library"))
 (allow file-read* (subpath "/Library/Frameworks"))
-(allow file-read* (subpath "/dev/urandom"))
-(allow file-read* (subpath "/dev/null"))
+(allow file-read* (subpath "/private/etc"))
 (allow file-read* (subpath "/private/var/db"))
+(allow file-read* (literal "/dev/urandom"))
+(allow file-read* (literal "/dev/null"))
+(allow file-read* (literal "/dev/random"))
 
 ;; Write access: workspace and temp only
 (allow file-write* (subpath "` + wsDir + `"))
@@ -434,11 +430,9 @@ func GenerateSandboxProfile(wsDir, venvDir, tmpDir string) string {
 
 ;; Block network access (no exfiltration, no reverse shells)
 (deny network*)
-
-;; Block home directory access
-(deny file-read* (subpath "` + homeDir + `"))
-(deny file-write* (subpath "` + homeDir + `"))
 `
+	// Note: no explicit home directory deny needed — (deny default) already
+	// blocks all paths not explicitly allowed above.
 	// Add venv read access if specified.
 	if venvDir != "" {
 		profile += `
