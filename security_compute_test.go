@@ -297,11 +297,12 @@ func TestGenerateSandboxProfile_Structure(t *testing.T) {
 		t.Error("sandbox profile missing network deny")
 	}
 
-	// Must deny home directory.
-	if !strings.Contains(profile, "(deny file-read* (subpath (user-home-path)))") {
+	// Must deny home directory (resolved as literal path, not Seatbelt function).
+	homeDir, _ := os.UserHomeDir()
+	if !strings.Contains(profile, `(deny file-read* (subpath "`+homeDir+`"))`) {
 		t.Error("sandbox profile missing home dir read deny")
 	}
-	if !strings.Contains(profile, "(deny file-write* (subpath (user-home-path)))") {
+	if !strings.Contains(profile, `(deny file-write* (subpath "`+homeDir+`"))`) {
 		t.Error("sandbox profile missing home dir write deny")
 	}
 

@@ -391,6 +391,13 @@ func ComputeEnvironment(wsDir, tmpDir, venvDir string) []string {
 // This is the primary defense: even if all other checks fail, the sandbox
 // confines the process.
 func GenerateSandboxProfile(wsDir, venvDir, tmpDir string) string {
+	// Resolve home directory for deny rules. The Seatbelt (user-home-path)
+	// function is unavailable when running as a service user, so we resolve
+	// it in Go and inject it as a string literal.
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		homeDir = "/Users"
+	}
 	profile := `(version 1)
 (deny default)
 
@@ -429,8 +436,8 @@ func GenerateSandboxProfile(wsDir, venvDir, tmpDir string) string {
 (deny network*)
 
 ;; Block home directory access
-(deny file-read* (subpath (user-home-path)))
-(deny file-write* (subpath (user-home-path)))
+(deny file-read* (subpath "` + homeDir + `"))
+(deny file-write* (subpath "` + homeDir + `"))
 `
 	// Add venv read access if specified.
 	if venvDir != "" {
