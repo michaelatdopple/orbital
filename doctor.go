@@ -60,6 +60,7 @@ func (dm *DoctorManager) RunChecks() DoctorResult {
 	checks = append(checks, dm.checkJava()...)
 	checks = append(checks, dm.checkAndroidNDK()...)
 	checks = append(checks, dm.checkGradle())
+	checks = append(checks, dm.checkUnity()...)
 	checks = append(checks, dm.checkBaseDir()...)
 	checks = append(checks, dm.checkOrbitalEnv())
 	checks = append(checks, dm.checkSharedVolumeToken())
@@ -348,6 +349,49 @@ func (dm *DoctorManager) checkAndroidNDK() []Check {
 			Name:    "NDK toolchain",
 			Status:  StatusOK,
 			Message: toolchain,
+		})
+	}
+
+	return checks
+}
+
+func (dm *DoctorManager) checkUnity() []Check {
+	var checks []Check
+
+	editorBase := "/Applications/Unity/Hub/Editor"
+	entries, err := os.ReadDir(editorBase)
+	if err != nil {
+		checks = append(checks, Check{
+			Name:    "Unity Editor",
+			Status:  StatusWarn,
+			Message: "Unity Hub editor directory not found (only needed for unity builds)",
+		})
+		return checks
+	}
+
+	var versions []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		// Verify the binary actually exists.
+		bin := filepath.Join(editorBase, e.Name(), "Unity.app/Contents/MacOS/Unity")
+		if _, err := os.Stat(bin); err == nil {
+			versions = append(versions, e.Name())
+		}
+	}
+
+	if len(versions) == 0 {
+		checks = append(checks, Check{
+			Name:    "Unity Editor",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("no Unity editors found in %s (only needed for unity builds)", editorBase),
+		})
+	} else {
+		checks = append(checks, Check{
+			Name:    "Unity Editor",
+			Status:  StatusOK,
+			Message: fmt.Sprintf("%d installed: %s", len(versions), strings.Join(versions, ", ")),
 		})
 	}
 

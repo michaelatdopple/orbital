@@ -275,16 +275,24 @@ func (wm *WorkspaceManager) pruneWorkspaceBuildDirs(maxAge time.Duration) {
 		if !e.IsDir() {
 			continue
 		}
+		// Prune Gradle build/ dirs.
 		buildDir := filepath.Join(dir, e.Name(), "build")
 		info, err := os.Stat(buildDir)
-		if err != nil {
-			continue
-		}
-		if info.ModTime().Before(cutoff) {
+		if err == nil && info.ModTime().Before(cutoff) {
 			if err := os.RemoveAll(buildDir); err != nil {
 				log.Printf("cleanup: failed to remove build dir in %s: %v", e.Name(), err)
 			} else {
 				log.Printf("cleanup: removed stale build dir in workspace %s", e.Name())
+			}
+		}
+		// Prune Unity Builds/ dirs.
+		buildsDir := filepath.Join(dir, e.Name(), "Builds")
+		info, err = os.Stat(buildsDir)
+		if err == nil && info.ModTime().Before(cutoff) {
+			if err := os.RemoveAll(buildsDir); err != nil {
+				log.Printf("cleanup: failed to remove Builds dir in %s: %v", e.Name(), err)
+			} else {
+				log.Printf("cleanup: removed stale Unity Builds dir in workspace %s", e.Name())
 			}
 		}
 	}

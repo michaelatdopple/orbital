@@ -325,6 +325,21 @@ func TestGenerateSandboxProfile_Structure(t *testing.T) {
 	if !strings.Contains(profile, "(allow process-exec)") {
 		t.Error("sandbox profile missing process-exec")
 	}
+
+	// Must allow file-map-executable (dyld needs this to load shared libraries).
+	if !strings.Contains(profile, "(allow file-map-executable)") {
+		t.Error("sandbox profile missing file-map-executable (dyld will SIGABRT)")
+	}
+
+	// Must allow process-info (codesigning checks, pid lookups).
+	if !strings.Contains(profile, "(allow process-info*)") {
+		t.Error("sandbox profile missing process-info")
+	}
+
+	// Must allow IPC shared memory (dyld shared cache).
+	if !strings.Contains(profile, "(allow ipc-posix-shm-read*)") {
+		t.Error("sandbox profile missing ipc-posix-shm-read")
+	}
 }
 
 func TestGenerateSandboxProfile_WithVenv(t *testing.T) {
@@ -438,6 +453,108 @@ func TestVenvPath_Format(t *testing.T) {
 	hash := parts[len(parts)-1]
 	if len(hash) != 12 {
 		t.Errorf("VenvPath hash should be 12 chars, got %d: %q", len(hash), hash)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ValidateUnityExecuteMethod tests
+// ---------------------------------------------------------------------------
+
+func TestValidateUnityExecuteMethod_Valid(t *testing.T) {
+	sp := testPolicy()
+	tests := []string{
+		"BuildScript.BuildAndroid",
+		"BuildScript.BuildIOS",
+		"MyNamespace.Builder.Build",
+		"Editor.BuildPipeline.Execute",
+		"A.B",
+	}
+	for _, method := range tests {
+		if err := sp.ValidateUnityExecuteMethod(method); err != nil {
+			t.Errorf("ValidateUnityExecuteMethod(%q): unexpected error: %v", method, err)
+		}
+	}
+}
+
+func TestValidateUnityExecuteMethod_Invalid(t *testing.T) {
+	sp := testPolicy()
+	tests := []struct {
+		method string
+		desc   string
+	}{
+		{"", "empty"},
+		{"BuildAndroid", "no dot"},
+		{"Build Script.Build", "space in name"},
+		{"Build;rm -rf /", "shell injection"},
+		{"$(whoami).Build", "command substitution"},
+		{"-executeMethod", "flag injection"},
+		{"Build/Script.Build", "path separator"},
+		{"Build\nScript.Build", "newline injection"},
+	}
+	for _, tt := range tests {
+		if err := sp.ValidateUnityExecuteMethod(tt.method); err == nil {
+			t.Errorf("ValidateUnityExecuteMethod(%q): expected error for %s", tt.method, tt.desc)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// readUnityVersion tests
+// ---------------------------------------------------------------------------
+
+func TestReadUnityVersion_Valid(t *testing.T) {
+	tmpDir := t.TempDir()
+	versionFile := filepath.Join(tmpDir, "ProjectVersion.txt")
+	content := "m_EditorVersion: 6000.3.2f1\nm_EditorVersionWithRevision: 6000.3.2f1 (abc123def456)\n"
+	os.WriteFile(versionFile, []byte(content), 0o644)
+
+	version, err := readUnityVersion(versionFile)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if version != "6000.3.2f1" {
+		t.Errorf("got %q, want %q", version, "6000.3.2f1")
+	}
+}
+
+func TestReadUnityVersion_MissingFile(t *testing.T) {
+	_, err := readUnityVersion("/nonexistent/ProjectVersion.txt")
+	if err == nil {
+		t.Error("expected error for missing file")
+	}
+}
+
+func TestReadUnityVersion_EmptyVersion(t *testing.T) {
+	tmpDir := t.TempDir()
+	versionFile := filepath.Join(tmpDir, "ProjectVersion.txt")
+	os.WriteFile(versionFile, []byte("m_EditorVersion: \n"), 0o644)
+
+	_, err := readUnityVersion(versionFile)
+	if err == nil {
+		t.Error("expected error for empty version")
+	}
+}
+
+func TestReadUnityVersion_NoVersionLine(t *testing.T) {
+	tmpDir := t.TempDir()
+	versionFile := filepath.Join(tmpDir, "ProjectVersion.txt")
+	os.WriteFile(versionFile, []byte("some_other_key: value\n"), 0o644)
+
+	_, err := readUnityVersion(versionFile)
+	if err == nil {
+		t.Error("expected error for missing m_EditorVersion")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// unityEditorPath tests
+// ---------------------------------------------------------------------------
+
+func TestUnityEditorPath(t *testing.T) {
+	path := unityEditorPath("6000.3.2f1")
+	expected := "/Applications/Unity/Hub/Editor/6000.3.2f1/Unity.app/Contents/MacOS/Unity"
+	if path != expected {
+		t.Errorf("got %q, want %q", path, expected)
 	}
 }
 

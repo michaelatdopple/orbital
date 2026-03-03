@@ -59,6 +59,7 @@ type Build struct {
 	SigningProfile string              `json:"signing_profile,omitempty"`
 	ComputeCommand string              `json:"compute_command,omitempty"`
 	Requirements   string              `json:"requirements,omitempty"`
+	ExecuteMethod  string              `json:"execute_method,omitempty"`
 	ExitCode       int                 `json:"exit_code"`
 	StartedAt    time.Time           `json:"started_at"`
 	FinishedAt   time.Time           `json:"finished_at,omitempty"`
@@ -215,6 +216,7 @@ type BuildRequest struct {
 	SigningProfile string             `json:"signing_profile,omitempty"`
 	ComputeCommand string             `json:"compute_command,omitempty"`
 	Requirements   string             `json:"requirements,omitempty"`
+	ExecuteMethod  string             `json:"execute_method,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -232,8 +234,8 @@ func (bm *BuildManager) StartBuild(req BuildRequest) (*Build, error) {
 	if buildType == "" {
 		buildType = "gradle"
 	}
-	if buildType != "gradle" && buildType != "script" && buildType != "compute" {
-		return nil, fmt.Errorf("invalid build_type %q: must be \"gradle\", \"script\", or \"compute\"", buildType)
+	if buildType != "gradle" && buildType != "script" && buildType != "compute" && buildType != "unity" {
+		return nil, fmt.Errorf("invalid build_type %q: must be \"gradle\", \"script\", \"compute\", or \"unity\"", buildType)
 	}
 
 	// Type-specific validation.
@@ -280,6 +282,19 @@ func (bm *BuildManager) StartBuild(req BuildRequest) (*Build, error) {
 		if err := bm.policy.ValidateRequirementsPath(req.Requirements); err != nil {
 			bm.audit.Log("build_rejected", map[string]string{
 				"reason":    "invalid_requirements_path",
+				"workspace": req.Workspace,
+				"error":     err.Error(),
+			})
+			return nil, err
+		}
+
+	case "unity":
+		if req.ExecuteMethod == "" {
+			return nil, fmt.Errorf("execute_method is required for unity builds")
+		}
+		if err := bm.policy.ValidateUnityExecuteMethod(req.ExecuteMethod); err != nil {
+			bm.audit.Log("build_rejected", map[string]string{
+				"reason":    "invalid_execute_method",
 				"workspace": req.Workspace,
 				"error":     err.Error(),
 			})
@@ -432,6 +447,31 @@ func (bm *BuildManager) StartBuild(req BuildRequest) (*Build, error) {
 				return nil, fmt.Errorf("requirements file not found: %s", req.Requirements)
 			}
 		}
+
+	case "unity":
+		// Verify ProjectSettings/ exists (proves it's a Unity project).
+		projectSettings := filepath.Join(wsDir, "ProjectSettings")
+		if _, err := os.Stat(projectSettings); err != nil {
+			bm.limiter.Release()
+			return nil, fmt.Errorf("not a Unity project: ProjectSettings/ not found in workspace %s", req.Workspace)
+		}
+		// Read Unity version and verify editor exists.
+		unityVersion, err := readUnityVersion(filepath.Join(projectSettings, "ProjectVersion.txt"))
+		if err != nil {
+			bm.limiter.Release()
+			return nil, fmt.Errorf("cannot determine Unity version: %w", err)
+		}
+		editorBin := unityEditorPath(unityVersion)
+		if _, err := os.Stat(editorBin); err != nil {
+			bm.limiter.Release()
+			return nil, fmt.Errorf("Unity editor %s not installed (expected at %s)", unityVersion, editorBin)
+		}
+		// Check for editor lock (Library/EditorInstance.json indicates Unity has the project open).
+		lockFile := filepath.Join(wsDir, "Library", "EditorInstance.json")
+		if _, err := os.Stat(lockFile); err == nil {
+			bm.limiter.Release()
+			return nil, fmt.Errorf("Unity editor appears to have this project open (Library/EditorInstance.json exists) — close Unity first")
+		}
 	}
 
 	// Generate build ID.
@@ -467,6 +507,7 @@ func (bm *BuildManager) StartBuild(req BuildRequest) (*Build, error) {
 		SigningProfile: req.SigningProfile,
 		ComputeCommand: req.ComputeCommand,
 		Requirements:   req.Requirements,
+		ExecuteMethod:  req.ExecuteMethod,
 		StartedAt:      time.Now(),
 		ArtifactDir:  filepath.Join("orbital", "artifacts", id, "out"),
 		done:         make(chan struct{}),
@@ -627,6 +668,12 @@ func (bm *BuildManager) runBuild(b *Build, wsDir, artifactDir string) {
 			return // error already logged and status set
 		}
 
+	case "unity":
+		cmd = bm.buildUnityCmd(b, wsDir)
+		if cmd == nil {
+			return // error already logged and status set
+		}
+
 	case "script":
 		cmd = exec.Command(filepath.Join(wsDir, b.BuildScript))
 		cmd.Dir = wsDir
@@ -696,6 +743,8 @@ func (bm *BuildManager) runBuild(b *Build, wsDir, artifactDir string) {
 	switch b.BuildType {
 	case "compute":
 		b.addLogLine(fmt.Sprintf("Started compute %s: %s", b.ID, b.ComputeCommand))
+	case "unity":
+		b.addLogLine(fmt.Sprintf("Started Unity build %s: %s", b.ID, b.ExecuteMethod))
 	case "script":
 		b.addLogLine(fmt.Sprintf("Started build %s: script %s", b.ID, b.BuildScript))
 	default:
@@ -788,9 +837,12 @@ func (bm *BuildManager) runBuild(b *Build, wsDir, artifactDir string) {
 	})
 
 	// Collect artifacts.
-	if b.BuildType == "compute" {
+	switch b.BuildType {
+	case "compute":
 		bm.collectComputeArtifacts(b, wsDir, artifactDir)
-	} else {
+	case "unity":
+		bm.collectUnityArtifacts(b, wsDir, artifactDir)
+	default:
 		bm.collectArtifacts(b, wsDir, artifactDir)
 	}
 
@@ -1050,6 +1102,137 @@ func (bm *BuildManager) collectComputeArtifacts(b *Build, wsDir, artifactDir str
 			if err != nil {
 				return nil
 			}
+			dst := filepath.Join(artifactDir, relPath)
+			if err := os.MkdirAll(filepath.Dir(dst), 0o775); err != nil {
+				return nil
+			}
+			if copyFile(path, dst) == nil {
+				artifacts = append(artifacts, relPath)
+			}
+			return nil
+		})
+	}
+
+	b.mu.Lock()
+	b.Artifacts = artifacts
+	b.mu.Unlock()
+}
+
+// ---------------------------------------------------------------------------
+// Unity execution
+// ---------------------------------------------------------------------------
+
+// unityEditorPath returns the path to the Unity editor binary for a given version.
+func unityEditorPath(version string) string {
+	return filepath.Join("/Applications/Unity/Hub/Editor", version, "Unity.app/Contents/MacOS/Unity")
+}
+
+// readUnityVersion parses the m_EditorVersion line from ProjectVersion.txt.
+func readUnityVersion(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("cannot read %s: %w", path, err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "m_EditorVersion:") {
+			version := strings.TrimSpace(strings.TrimPrefix(line, "m_EditorVersion:"))
+			if version == "" {
+				return "", fmt.Errorf("empty m_EditorVersion in %s", path)
+			}
+			return version, nil
+		}
+	}
+	return "", fmt.Errorf("m_EditorVersion not found in %s", path)
+}
+
+// buildUnityCmd constructs the Unity CLI command for a headless build.
+// Returns nil (and sets build status to failed) on error.
+func (bm *BuildManager) buildUnityCmd(b *Build, wsDir string) *exec.Cmd {
+	// Read Unity version from the project.
+	versionFile := filepath.Join(wsDir, "ProjectSettings", "ProjectVersion.txt")
+	unityVersion, err := readUnityVersion(versionFile)
+	if err != nil {
+		b.addLogLine(fmt.Sprintf("ERROR: %v", err))
+		b.mu.Lock()
+		b.Status = StatusFailed
+		b.ExitCode = -1
+		b.FinishedAt = time.Now()
+		b.mu.Unlock()
+		return nil
+	}
+
+	editorBin := unityEditorPath(unityVersion)
+	b.addLogLine(fmt.Sprintf("Unity editor: %s (%s)", unityVersion, editorBin))
+	b.addLogLine(fmt.Sprintf("Execute method: %s", b.ExecuteMethod))
+
+	// Unity CLI: -batchmode -quit -nographics -projectPath <ws> -executeMethod <method> -logFile -
+	// -logFile - sends log output to stdout for our SSE streaming.
+	cmd := exec.Command(editorBin,
+		"-batchmode",
+		"-quit",
+		"-nographics",
+		"-projectPath", wsDir,
+		"-executeMethod", b.ExecuteMethod,
+		"-logFile", "-",
+	)
+	cmd.Dir = wsDir
+
+	return cmd
+}
+
+// collectUnityArtifacts scans for Unity build outputs (.apk, .aab, .ipa, .app).
+// Checks workspace root, Builds/ directory, and explicit artifact_dirs.
+func (bm *BuildManager) collectUnityArtifacts(b *Build, wsDir, artifactDir string) {
+	unityArtifactExts := map[string]bool{
+		".apk": true,
+		".aab": true,
+		".ipa": true,
+	}
+
+	// Directories to scan for artifacts.
+	var scanDirs []string
+	if len(b.ArtifactDirs) > 0 {
+		for _, relDir := range b.ArtifactDirs {
+			absDir, err := safeSubpath(wsDir, relDir)
+			if err != nil {
+				continue
+			}
+			if dirExists(absDir) {
+				scanDirs = append(scanDirs, absDir)
+			}
+		}
+	}
+	// Always check Builds/ and workspace root.
+	if buildsDir := filepath.Join(wsDir, "Builds"); dirExists(buildsDir) {
+		scanDirs = append(scanDirs, buildsDir)
+	}
+	scanDirs = append(scanDirs, wsDir)
+
+	var artifacts []string
+	seen := map[string]bool{}
+	for _, dir := range scanDirs {
+		_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+			if err != nil || info.IsDir() {
+				return nil
+			}
+			// Skip Library/ directory (Unity cache).
+			relToWs, _ := filepath.Rel(wsDir, path)
+			if strings.HasPrefix(relToWs, "Library"+string(filepath.Separator)) || relToWs == "Library" {
+				return filepath.SkipDir
+			}
+
+			ext := strings.ToLower(filepath.Ext(info.Name()))
+			if !unityArtifactExts[ext] {
+				return nil
+			}
+
+			relPath, err := filepath.Rel(wsDir, path)
+			if err != nil || seen[relPath] {
+				return nil
+			}
+			seen[relPath] = true
+
 			dst := filepath.Join(artifactDir, relPath)
 			if err := os.MkdirAll(filepath.Dir(dst), 0o775); err != nil {
 				return nil

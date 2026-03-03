@@ -422,11 +422,24 @@ func GenerateSandboxProfile(wsDir, venvDir, tmpDir string) string {
 (allow process-exec)
 (allow process-fork)
 
+;; Allow dyld to map shared libraries into memory.
+;; file-read* does NOT cover file-map-executable — without this,
+;; dyld cannot load any dylibs and the process ABORTs (SIGABRT/134).
+(allow file-map-executable)
+
 ;; Allow sysctl reads (required by Python, Node)
 (allow sysctl-read)
 
-;; Allow mach lookups (required for CoreML, Metal)
+;; Mach IPC (required by dyld, libSystem, CoreFoundation)
 (allow mach-lookup)
+(allow mach-register)
+
+;; POSIX shared memory (required by dyld shared cache)
+(allow ipc-posix-shm-read*)
+(allow ipc-posix-shm-write*)
+
+;; Allow process info (codesigning checks, pid lookups)
+(allow process-info*)
 
 ;; Block network access (no exfiltration, no reverse shells)
 (deny network*)
@@ -452,6 +465,24 @@ func (sp *SecurityPolicy) ComputeResourceLimitArgs() string {
 	fileKB := sp.ComputeFileSizeLimitBytes / 1024
 	nproc := sp.ComputeMaxProcesses
 	return fmt.Sprintf("ulimit -v %d && ulimit -f %d && ulimit -u %d", memKB, fileKB, nproc)
+}
+
+// ValidateUnityExecuteMethod validates a Unity -executeMethod argument.
+// Must be a valid C# qualified name (e.g. "BuildScript.BuildAndroid")
+// containing at least one dot separator. Prevents shell injection.
+func (sp *SecurityPolicy) ValidateUnityExecuteMethod(method string) error {
+	if method == "" {
+		return fmt.Errorf("execute method is required")
+	}
+	// Must match a C# qualified identifier: letters/digits/underscores with dots.
+	pat := regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_.]+$`)
+	if !pat.MatchString(method) {
+		return fmt.Errorf("invalid execute method %q: must be a valid C# qualified name (letters, digits, underscores, dots)", method)
+	}
+	if !strings.Contains(method, ".") {
+		return fmt.Errorf("invalid execute method %q: must contain at least one dot (e.g. BuildScript.BuildAndroid)", method)
+	}
+	return nil
 }
 
 // ResolveSigningProfile looks up a signing profile from environment variables
