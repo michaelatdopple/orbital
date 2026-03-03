@@ -1168,14 +1168,18 @@ func (bm *BuildManager) buildUnityCmd(b *Build, wsDir string) *exec.Cmd {
 
 	// Unity CLI: -batchmode -quit -nographics -projectPath <ws> -executeMethod <method> -logFile -
 	// -logFile - sends log output to stdout for our SSE streaming.
-	cmd := exec.Command(editorBin,
-		"-batchmode",
-		"-quit",
-		"-nographics",
-		"-projectPath", wsDir,
-		"-executeMethod", b.ExecuteMethod,
-		"-logFile", "-",
+	//
+	// Wrap in sh -c with explicit umask 002 so Unity-created directories
+	// (Library/, Temp/, Logs/, UserSettings/) are group-writable. Unity
+	// ignores the parent process umask and creates dirs with 755 by default,
+	// which breaks the orbital permission model (host user needs group-write
+	// access to open the workspace in Unity Hub).
+	innerCmd := fmt.Sprintf("umask 002 && exec %s -batchmode -quit -nographics -projectPath %s -executeMethod %s -logFile -",
+		shellQuote(editorBin),
+		shellQuote(wsDir),
+		shellQuote(b.ExecuteMethod),
 	)
+	cmd := exec.Command("sh", "-c", innerCmd)
 	cmd.Dir = wsDir
 
 	return cmd
