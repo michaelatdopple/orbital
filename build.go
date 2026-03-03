@@ -59,8 +59,9 @@ type Build struct {
 	SigningProfile string              `json:"signing_profile,omitempty"`
 	ComputeCommand string              `json:"compute_command,omitempty"`
 	Requirements   string              `json:"requirements,omitempty"`
-	ExecuteMethod  string              `json:"execute_method,omitempty"`
-	ExitCode       int                 `json:"exit_code"`
+	ExecuteMethod    string              `json:"execute_method,omitempty"`
+	PersonalLicense  bool                `json:"personal_license,omitempty"`
+	ExitCode         int                 `json:"exit_code"`
 	StartedAt    time.Time           `json:"started_at"`
 	FinishedAt   time.Time           `json:"finished_at,omitempty"`
 	ArtifactDir  string              `json:"artifact_dir"`
@@ -216,7 +217,8 @@ type BuildRequest struct {
 	SigningProfile string             `json:"signing_profile,omitempty"`
 	ComputeCommand string             `json:"compute_command,omitempty"`
 	Requirements   string             `json:"requirements,omitempty"`
-	ExecuteMethod  string             `json:"execute_method,omitempty"`
+	ExecuteMethod    string             `json:"execute_method,omitempty"`
+	PersonalLicense  bool               `json:"personal_license,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -507,8 +509,9 @@ func (bm *BuildManager) StartBuild(req BuildRequest) (*Build, error) {
 		SigningProfile: req.SigningProfile,
 		ComputeCommand: req.ComputeCommand,
 		Requirements:   req.Requirements,
-		ExecuteMethod:  req.ExecuteMethod,
-		StartedAt:      time.Now(),
+		ExecuteMethod:    req.ExecuteMethod,
+		PersonalLicense:  req.PersonalLicense,
+		StartedAt:        time.Now(),
 		ArtifactDir:  filepath.Join("orbital", "artifacts", id, "out"),
 		done:         make(chan struct{}),
 	}
@@ -1166,19 +1169,34 @@ func (bm *BuildManager) buildUnityCmd(b *Build, wsDir string) *exec.Cmd {
 	b.addLogLine(fmt.Sprintf("Unity editor: %s (%s)", unityVersion, editorBin))
 	b.addLogLine(fmt.Sprintf("Execute method: %s", b.ExecuteMethod))
 
-	// Unity CLI: -batchmode -quit -nographics -projectPath <ws> -executeMethod <method> -logFile -
+	// Build the Unity CLI arguments.
 	// -logFile - sends log output to stdout for our SSE streaming.
 	//
+	// Personal license: Unity personal/free does not support -batchmode.
+	// Omit -batchmode and -nographics so Unity opens briefly with UI,
+	// runs the executeMethod, then exits via EditorApplication.Exit().
+	var unityArgs string
+	if b.PersonalLicense {
+		b.addLogLine("License mode: personal (no -batchmode)")
+		unityArgs = fmt.Sprintf("%s -quit -projectPath %s -executeMethod %s -logFile -",
+			shellQuote(editorBin),
+			shellQuote(wsDir),
+			shellQuote(b.ExecuteMethod),
+		)
+	} else {
+		unityArgs = fmt.Sprintf("%s -batchmode -quit -nographics -projectPath %s -executeMethod %s -logFile -",
+			shellQuote(editorBin),
+			shellQuote(wsDir),
+			shellQuote(b.ExecuteMethod),
+		)
+	}
+
 	// Wrap in sh -c with explicit umask 002 so Unity-created directories
 	// (Library/, Temp/, Logs/, UserSettings/) are group-writable. Unity
 	// ignores the parent process umask and creates dirs with 755 by default,
 	// which breaks the orbital permission model (host user needs group-write
 	// access to open the workspace in Unity Hub).
-	innerCmd := fmt.Sprintf("umask 002 && exec %s -batchmode -quit -nographics -projectPath %s -executeMethod %s -logFile -",
-		shellQuote(editorBin),
-		shellQuote(wsDir),
-		shellQuote(b.ExecuteMethod),
-	)
+	innerCmd := "umask 002 && exec " + unityArgs
 	cmd := exec.Command("sh", "-c", innerCmd)
 	cmd.Dir = wsDir
 
